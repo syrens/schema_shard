@@ -28,6 +28,19 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: schema_shard_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -37,20 +50,26 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
 
-      - name: Install pg dependencies & bundle with PG_INTEGRATION=1
+      - name: Install DB client dependencies & bundle with PG + MySQL integration
         env:
           PG_INTEGRATION: '1'
+          MYSQL_INTEGRATION: '1'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq libpq-dev
           bundle install
 
-      - name: Run RSpec (unit + SQLite + PostgreSQL live integration)
+      - name: Run RSpec (unit + SQLite + PostgreSQL 16 + MySQL 8 live integration)
         env:
           PG_INTEGRATION: '1'
           PG_HOST: 127.0.0.1
           PG_USER: postgres
           PG_PASSWORD: postgres
           PG_DATABASE: schema_shard_test
+          MYSQL_INTEGRATION: '1'
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_USER: root
+          MYSQL_PASSWORD: root
+          MYSQL_DATABASE: schema_shard_test
         run: bundle exec rspec
 
       - name: Run RuboCop
@@ -58,3 +77,46 @@ jobs:
 
       - name: Build gem
         run: gem build schema_shard.gemspec
+
+  mariadb-mysql2:
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: schema_shard_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Install mysql2 dependencies & bundle
+        env:
+          MYSQL_INTEGRATION: '1'
+          MYSQL_ADAPTER: mysql2
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libmariadb-dev
+          bundle install
+
+      - name: Run MariaDB 11 + mysql2 live integration spec
+        env:
+          MYSQL_INTEGRATION: '1'
+          MYSQL_ADAPTER: mysql2
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_USER: root
+          MYSQL_PASSWORD: root
+          MYSQL_DATABASE: schema_shard_test
+        run: bundle exec rspec spec/integration/mysql_integration_spec.rb

@@ -22,7 +22,10 @@ module SchemaShard
       connection_discards_total
     ].freeze
 
-    def initialize
+    OVERFLOW_SHARD_LABEL = '_other'
+
+    def initialize(configuration: nil)
+      @configuration = configuration
       @metrics       = Concurrent::Map.new
       @shard_metrics = Concurrent::Map.new
       METRIC_KEYS.each { |k| @metrics[k] = Concurrent::AtomicFixnum.new(0) }
@@ -40,7 +43,7 @@ module SchemaShard
       key = metric_name.to_sym
       return unless SHARD_METRIC_KEYS.include?(key)
 
-      shard_str = shard_key.to_s
+      shard_str = resolve_tracked_shard_key(shard_key.to_s)
       shard_map = @shard_metrics.compute_if_absent(shard_str) { Concurrent::Map.new }
       counter   = shard_map.compute_if_absent(key) { Concurrent::AtomicFixnum.new(0) }
       counter.increment(count)
@@ -112,6 +115,15 @@ module SchemaShard
     end
 
     private
+
+    def resolve_tracked_shard_key(shard_str)
+      return shard_str if @shard_metrics.key?(shard_str)
+
+      limit = @configuration&.max_tracked_shards.to_i
+      return shard_str unless limit.positive? && @shard_metrics.size >= limit
+
+      OVERFLOW_SHARD_LABEL
+    end
 
     def append_global_prometheus_lines(lines, global_metrics)
       global_metrics.each do |name, value|

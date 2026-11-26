@@ -127,6 +127,26 @@ if ENV['PG_INTEGRATION'] == '1'
       end
     end
 
+    it 'detects raw SQL SET search_path mutation when live_verify_fast_path is enabled' do
+      SchemaShard.configuration.live_verify_fast_path = true
+
+      SchemaShard.with('tenant_acme') do
+        ActiveRecord::Base.connection.execute('SET search_path TO "tenant_globex"')
+        expect(SchemaShard.with('tenant_acme') { item_model.pluck(:name) }).to eq(['acme_row'])
+      end
+    end
+
+    it 'restores public search_path on checkin after raw SQL SET search_path + exception' do
+      expect do
+        SchemaShard.with('tenant_acme') do
+          ActiveRecord::Base.connection.execute('SET search_path TO "tenant_globex"')
+          raise 'boom after raw SET'
+        end
+      end.to raise_error(RuntimeError, 'boom after raw SET')
+
+      expect(SchemaShard.on_shard('pg_shard') { item_model.pluck(:name) }).to eq(['public_row'])
+    end
+
     it 'supports shard-only routing (.on_shard) and explicit .with_public' do
       expect(SchemaShard.on_shard('pg_shard') { item_model.pluck(:name) }).to eq(['public_row'])
       expect(SchemaShard.with_public { item_model.pluck(:name) }).to eq(['public_row'])
@@ -177,6 +197,9 @@ if ENV['PG_INTEGRATION'] == '1'
         end
 
         expect { item_model.pluck(:name) }.to raise_error(SchemaShard::TaintedConnectionError)
+        expect do
+          SchemaShard.with('tenant_globex') { item_model.pluck(:name) }
+        end.to raise_error(SchemaShard::TaintedConnectionError)
       end
 
       expect(SchemaShard.with('tenant_acme') { item_model.pluck(:name) }).to eq(['acme_row'])
@@ -202,6 +225,47 @@ if ENV['PG_INTEGRATION'] == '1'
       until results.empty?
         _tenant, expected, actual = results.pop
         expect(actual).to eq(expected)
+      end
+    end
+
+    it 'keeps parent PostgreSQL pool healthy after a real Process.fork child discards inherited TCP sockets' do
+      skip 'Process.fork not supported on this platform' unless Process.respond_to?(:fork)
+
+      expect(SchemaShard.with('tenant_acme') { item_model.pluck(:name) }).to eq(['acme_row'])
+      expect(SchemaShard.pool_count).to eq(1)
+
+      pid = Process.fork do
+        SchemaShard.discard_pools_after_fork!
+        exit!(SchemaShard.pool_count.zero? ? 0 : 1)
+      end
+      _, status = Process.wait2(pid)
+
+      expect(status.exitstatus).to eq(0)
+      expect(SchemaShard.with('tenant_acme') { item_model.pluck(:name) }).to eq(['acme_row'])
+      expect(SchemaShard.with('tenant_globex') { item_model.pluck(:name) }).to eq(['globex_row'])
+    end
+
+    it 'prevents cross-tenant query cache leakage under concurrent Model.cache blocks' do
+      results = Queue.new
+
+      threads = Array.new(6) do
+        Thread.new do
+          item_model.cache do
+            3.times do
+              acme   = SchemaShard.with('tenant_acme') { item_model.pluck(:name) }
+              globex = SchemaShard.with('tenant_globex') { item_model.pluck(:name) }
+              results << [acme, globex]
+            end
+          end
+        end
+      end
+
+      threads.each(&:join)
+
+      until results.empty?
+        acme, globex = results.pop
+        expect(acme).to eq(['acme_row'])
+        expect(globex).to eq(['globex_row'])
       end
     end
   end
