@@ -246,18 +246,24 @@ module SchemaShard
 
     def same_active_context?(shard_key, shard_config, tenant, read_only, tenant_adapter, db_adapter)
       conn = ExecutionContext.active_connection
-      return false if conn.nil?
-      return false unless ExecutionContext.current_shard_label == shard_key
-      return false unless ExecutionContext.current_config == shard_config
-      return false unless ExecutionContext.current_tenant == tenant
-      return false unless ExecutionContext.read_only? == read_only
+      return false unless conn && context_metadata_matches?(shard_key, shard_config, tenant, read_only)
 
-      if tenant && tenant_adapter.switches_tenant? &&
-         !tenant_adapter.matches_current?(tenant, conn: conn, db_adapter: db_adapter)
-        return false
+      live = configuration.live_verify_fast_path
+      if tenant && tenant_adapter.switches_tenant?
+        return tenant_adapter.matches_current?(tenant, conn: conn, db_adapter: db_adapter, live: live)
       end
 
-      true
+      return true unless tenant.nil? && db_adapter.supports_namespaces?
+
+      default_ns = tenant_adapter.default_namespace(shard_config, db_adapter: db_adapter)
+      db_adapter.namespace_matches?(conn, default_ns, persistent_schemas: tenant_adapter.persistent_schemas, live: live)
+    end
+
+    def context_metadata_matches?(shard_key, shard_config, tenant, read_only)
+      ExecutionContext.current_shard_label == shard_key &&
+        ExecutionContext.current_config == shard_config &&
+        ExecutionContext.current_tenant == tenant &&
+        ExecutionContext.read_only? == read_only
     end
 
     def with_read_only_guard(read_only, &)
@@ -290,8 +296,13 @@ module SchemaShard
     end
 
     def checkout_connection(pool, &)
-      params = pool.method(:with_connection).parameters
-      if params.any? { |type, name| type == :key && name == :prevent_permanent_checkout }
+      @checkout_cap_cache ||= Concurrent::Map.new
+      supports_key = @checkout_cap_cache.compute_if_absent(pool.class) do
+        params = pool.method(:with_connection).parameters
+        params.any? { |type, name| type == :key && name == :prevent_permanent_checkout }
+      end
+
+      if supports_key
         pool.with_connection(prevent_permanent_checkout: true, &)
       else
         pool.with_connection(&)
@@ -301,8 +312,8 @@ module SchemaShard
     def run_on_connection(pool, conn, scope, enclosing:, reentrant:, &block)
       block_raised    = false
       tenant_switched = !scope[:tenant].nil? && scope[:tenant_adapter].switches_tenant?
-      frame           = ExecutionContext.push_pool_frame(pool, tenant: scope[:tenant], tenant_switched: tenant_switched)
-      ExecutionContext.mark_enclosing_pool_dirty(pool) if reentrant && tenant_switched
+      ExecutionContext.mark_pool_frames_dirty(pool) if reentrant && tenant_switched
+      frame = ExecutionContext.push_pool_frame(pool, tenant: scope[:tenant], tenant_switched: tenant_switched)
 
       begin
         scope[:db_adapter].prepare_connection(conn, read_only: scope[:read_only])
@@ -321,12 +332,15 @@ module SchemaShard
         raise
       ensure
         ExecutionContext.pop_pool_frame(pool)
-        cleanup_after_connection(
-          pool, conn, scope,
-          enclosing: enclosing, reentrant: reentrant,
-          tenant_switched: tenant_switched || frame[:dirty], block_raised: block_raised
-        )
-        pool.release_connection if !reentrant && pool.respond_to?(:release_connection)
+        begin
+          cleanup_after_connection(
+            pool, conn, scope,
+            enclosing: enclosing, reentrant: reentrant,
+            tenant_switched: tenant_switched || frame[:dirty], block_raised: block_raised
+          )
+        ensure
+          pool.release_connection if !reentrant && pool.respond_to?(:release_connection)
+        end
       end
     end
 

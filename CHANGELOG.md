@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-11-26
+
+### Fixed
+- Hardened cross-shard `A -> B -> A` nesting and `.with` inside `.on_shard` dirty-frame propagation.
+- Fixed namespace restoration error handling so restore failures on clean block exit are never swallowed while in-flight exceptions are preserved.
+- Added Rails 8 `lease_connection` and `retrieve_connection` routing with `prevent_permanent_checkout: true` and `pool.release_connection` in inner `ensure`.
+- Fixed `custom_connection_model?` via `connection_class_for_self` and `primary_class?` to protect `connects_to` subclasses (`SolidQueue::Job`, `SolidCache::Entry`, etc.).
+- Fixed fork safety to call `ConnectionPool#discard!` (never `disconnect!`).
+- Added `ConnectionUrlResolver` support for `url:` shard configs and SQLite `%{tenant}` URL templates.
+- Fixed MySQL 8 / Trilogy `non_idle_transaction?` fail-closed handling and `Sqlite#default_namespace_for`.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

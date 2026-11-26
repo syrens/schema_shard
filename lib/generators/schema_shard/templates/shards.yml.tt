@@ -1,6 +1,4 @@
 default: &default
-  adapter: postgresql
-  encoding: unicode
   pool: <%= ENV.fetch('RAILS_MAX_THREADS', 5) %>
   checkout_timeout: 5
   reaping_frequency: 10
@@ -8,6 +6,8 @@ default: &default
 development:
   shard01:
     <<: *default
+    adapter: postgresql
+    encoding: unicode
     host: <%= ENV.fetch('SHARD01_DB_HOST', 'localhost') %>
     port: <%= ENV.fetch('SHARD01_DB_PORT', 5432) %>
     database: <%= ENV.fetch('SHARD01_DB_NAME', 'app_development') %>
@@ -17,6 +17,8 @@ development:
 test:
   shard01:
     <<: *default
+    adapter: postgresql
+    encoding: unicode
     host: <%= ENV.fetch('SHARD01_DB_HOST', 'localhost') %>
     port: <%= ENV.fetch('SHARD01_DB_PORT', 5432) %>
     database: <%= ENV.fetch('SHARD01_DB_NAME', 'app_test') %>

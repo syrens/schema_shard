@@ -40,9 +40,9 @@ module SchemaShard
         nil
       end
 
-      def matches_current?(tenant, conn:, db_adapter:)
-        live = current(conn: conn, db_adapter: db_adapter)
-        live.nil? || live.to_s == tenant.to_s
+      def matches_current?(tenant, conn:, db_adapter:, live: false) # rubocop:disable Lint/UnusedMethodArgument
+        live_current = current(conn: conn, db_adapter: db_adapter)
+        live_current.nil? || live_current.to_s == tenant.to_s
       end
 
       def default_namespace(shard_config = nil, db_adapter: nil)

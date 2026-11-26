@@ -52,7 +52,7 @@ module SchemaShard
       st = state
       frames = (st[POOL_FRAMES_KEY] ||= {}.compare_by_identity)
       stack  = (frames[pool] ||= [])
-      frame  = { tenant: tenant, tenant_switched: tenant_switched, dirty: false }
+      frame  = { tenant: tenant, tenant_switched: tenant_switched, dirty: false, tainted: false }
       stack.push(frame)
       frame
     end
@@ -69,9 +69,25 @@ module SchemaShard
       frame
     end
 
-    def mark_enclosing_pool_dirty(pool)
-      frame = enclosing_pool_frame(pool)
-      frame[:dirty] = true if frame
+    def mark_pool_frames_dirty(pool)
+      frames = state[POOL_FRAMES_KEY]
+      return unless frames
+
+      frames[pool]&.each { |f| f[:dirty] = true }
+    end
+
+    def mark_pool_frames_tainted(pool)
+      frames = state[POOL_FRAMES_KEY]
+      return unless frames
+
+      frames[pool]&.each { |f| f[:tainted] = true }
+    end
+
+    def active_pool_tainted?
+      pool = state[POOL_KEY]
+      return false unless pool
+
+      enclosing_pool_frame(pool)&.dig(:tainted) == true
     end
 
     def with_context(shard_key:, config:, tenant:, read_only:)

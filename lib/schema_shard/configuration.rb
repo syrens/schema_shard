@@ -8,7 +8,7 @@ module SchemaShard
                   :tenant_adapter, :default_schema, :persistent_schemas,
                   :excluded_models, :default_pool_size, :checkout_timeout,
                   :reaping_frequency, :logger, :env, :log_shard_queries,
-                  :auto_fork_safety
+                  :auto_fork_safety, :live_verify_fast_path
     attr_writer :config_path
     attr_reader :tenant_mode, :max_pools, :cleanup_threshold
 
@@ -29,8 +29,9 @@ module SchemaShard
       @reaping_frequency  = 10
       @logger             = nil
       @env                = nil
-      @log_shard_queries  = false
-      @auto_fork_safety   = true
+      @log_shard_queries     = false
+      @auto_fork_safety      = true
+      @live_verify_fast_path = false
     end
 
     def config_path

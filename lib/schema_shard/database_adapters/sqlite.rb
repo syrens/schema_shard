@@ -65,11 +65,16 @@ module SchemaShard
         yield
       end
 
+      def default_namespace_for(_shard_cfg, configured_default: nil) # rubocop:disable Lint/UnusedMethodArgument
+        nil
+      end
+
       def non_idle_transaction?(conn)
         return true if conn.respond_to?(:open_transactions) && conn.open_transactions.to_i.positive?
 
         if conn.respond_to?(:raw_connection)
           raw = conn.raw_connection
+          return true if raw.nil?
           return true if raw.respond_to?(:transaction_active?) && raw.transaction_active?
         end
 

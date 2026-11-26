@@ -166,6 +166,22 @@ if ENV['PG_INTEGRATION'] == '1'
       expect(SchemaShard.with('tenant_globex') { item_model.pluck(:name) }).to eq(['globex_row'])
     end
 
+    it 'fails closed on subsequent queries if outer block rescues nested TaintedConnectionError' do
+      SchemaShard.with('tenant_acme') do
+        begin
+          SchemaShard.with('tenant_globex') do
+            ActiveRecord::Base.connection.raw_connection.exec('BEGIN')
+          end
+        rescue SchemaShard::TaintedConnectionError
+          # outer block attempts to continue after catching taint
+        end
+
+        expect { item_model.pluck(:name) }.to raise_error(SchemaShard::TaintedConnectionError)
+      end
+
+      expect(SchemaShard.with('tenant_acme') { item_model.pluck(:name) }).to eq(['acme_row'])
+    end
+
     it 'maintains strict cross-tenant isolation under concurrent threads' do
       results = Queue.new
 

@@ -110,7 +110,7 @@ module SchemaShard
         nil
       end
 
-      def namespace_matches?(_conn, _expected_tenant, persistent_schemas: []) # rubocop:disable Lint/UnusedMethodArgument
+      def namespace_matches?(_conn, _expected_tenant, persistent_schemas: [], live: false) # rubocop:disable Lint/UnusedMethodArgument
         true
       end
 

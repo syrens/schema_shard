@@ -15,8 +15,8 @@ module SchemaShard
         ::Apartment::Tenant.current.to_s
       end
 
-      def matches_current?(tenant, conn:, db_adapter:)
-        super && db_adapter.namespace_matches?(conn, tenant, persistent_schemas: persistent_schemas)
+      def matches_current?(tenant, conn:, db_adapter:, live: false)
+        super && db_adapter.namespace_matches?(conn, tenant, persistent_schemas: persistent_schemas, live: live)
       end
 
       def default_namespace(shard_config = nil, db_adapter: nil)
