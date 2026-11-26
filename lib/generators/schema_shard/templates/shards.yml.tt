@@ -1,0 +1,29 @@
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch('RAILS_MAX_THREADS', 5) %>
+  checkout_timeout: 5
+  reaping_frequency: 10
+
+development:
+  shard01:
+    <<: *default
+    host: <%= ENV.fetch('SHARD01_DB_HOST', 'localhost') %>
+    port: <%= ENV.fetch('SHARD01_DB_PORT', 5432) %>
+    database: <%= ENV.fetch('SHARD01_DB_NAME', 'app_development') %>
+    username: <%= ENV.fetch('SHARD01_DB_USERNAME', 'postgres') %>
+    password: <%= ENV.fetch('SHARD01_DB_PASSWORD', '') %>
+
+test:
+  shard01:
+    <<: *default
+    host: <%= ENV.fetch('SHARD01_DB_HOST', 'localhost') %>
+    port: <%= ENV.fetch('SHARD01_DB_PORT', 5432) %>
+    database: <%= ENV.fetch('SHARD01_DB_NAME', 'app_test') %>
+    username: <%= ENV.fetch('SHARD01_DB_USERNAME', 'postgres') %>
+    password: <%= ENV.fetch('SHARD01_DB_PASSWORD', '') %>
+
+production:
+  shard01:
+    <<: *default
+    url: <%= ENV['SHARD01_DATABASE_URL'] %>

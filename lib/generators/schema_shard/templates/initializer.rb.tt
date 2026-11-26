@@ -1,0 +1,40 @@
+# frozen_string_literal: true
+
+SchemaShard.configure do |config|
+  # Path to your shards YAML file (ERB-enabled)
+  config.config_path = Rails.root.join('config', 'shards.yml')
+
+  # Optional top-level YAML key (leave nil for standard env-at-root layout)
+  # config.config_root_key = nil
+
+  # Optional default shard key when omitted from SchemaShard.with / SchemaShard.on_shard
+  config.default_shard = 'shard01'
+
+  # Tenant isolation adapter:
+  #   :auto      - uses ros-apartment if loaded, otherwise native DB switching
+  #   :apartment - forces ros-apartment
+  #   :native    - zero-dependency DB switching (PG search_path, MySQL USE, SQLite file)
+  #   :none      - pure shard / read-replica routing with no tenant switching
+  config.tenant_adapter = :auto
+
+  # Tenant validation mode:
+  #   :strict   - fail-closed; nil or default schema raises InvalidTenantError (recommended for SaaS)
+  #   :optional - nil tenant gracefully falls back to the shard's default schema/database
+  #   :none     - disables tenant switching completely
+  config.tenant_mode = :strict
+
+  # Shared models that should NEVER be routed to a shard connection
+  # (automatically merged with Apartment.excluded_models when Apartment is present)
+  config.excluded_models = []
+
+  # PostgreSQL default schema & persistent schemas (e.g. extensions)
+  config.default_schema = 'public'
+  config.persistent_schemas = []
+
+  # Connection pool LRU limits
+  config.max_pools = ENV.fetch('SCHEMA_SHARD_MAX_POOLS', 10).to_i
+  config.cleanup_threshold = ENV.fetch('SCHEMA_SHARD_CLEANUP_THRESHOLD', 8).to_i
+
+  # Log SQL queries tagged with active shard & tenant in development
+  config.log_shard_queries = Rails.env.development?
+end
