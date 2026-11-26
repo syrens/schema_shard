@@ -7,7 +7,7 @@ module SchemaShard
 
       case configuration.tenant_adapter
       when :auto
-        if defined?(Apartment::Tenant)
+        if defined?(::Apartment::Tenant)
           Apartment.new(configuration)
         else
           Native.new(configuration)

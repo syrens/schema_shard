@@ -155,6 +155,18 @@ RSpec.describe SchemaShard do
     end
   end
 
+  describe 'TenantAdapters.resolve (:auto)' do
+    it 'auto-detects top-level ::Apartment::Tenant when loaded' do
+      described_class.configuration.tenant_adapter = :auto
+      expect(SchemaShard::TenantAdapters.resolve(described_class.configuration))
+        .to be_a(SchemaShard::TenantAdapters::Native)
+
+      stub_const('::Apartment::Tenant', Module.new)
+      expect(SchemaShard::TenantAdapters.resolve(described_class.configuration))
+        .to be_a(SchemaShard::TenantAdapters::Apartment)
+    end
+  end
+
   describe 'nested execution, query cache hygiene, and fail-closed sanitization' do
     it 'clears query cache on entry and exit of nested same-shard different-tenant switches' do
       expect(fake_conn).to receive(:clear_query_cache).at_least(4).times
