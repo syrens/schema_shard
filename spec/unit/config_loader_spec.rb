@@ -54,4 +54,11 @@ RSpec.describe SchemaShard::ConfigLoader do
     cfg = loader.fetch!('replica')
     expect(cfg['adapter']).to eq('sqlite3')
   end
+
+  it 'infers sqlite3 adapter for %{tenant} URL templates without explicit adapter key' do
+    configuration.shards = { 'test' => { 'tenants' => { 'url' => 'sqlite3:///storage/%{tenant}.sqlite3' } } }
+    cfg = loader.fetch!('tenants')
+    expect(cfg['adapter']).to eq('sqlite3')
+    expect(cfg['url']).to eq('sqlite3:///storage/%{tenant}.sqlite3')
+  end
 end

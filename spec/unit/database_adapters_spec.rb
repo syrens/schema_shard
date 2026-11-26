@@ -63,6 +63,21 @@ RSpec.describe SchemaShard::DatabaseAdapters do
       expect(adapter.non_idle_transaction?(conn)).to be(true)
     end
 
+    it 'does not discard clean connections on trilogy < 2.12.0 when Result#in_transaction? is absent' do
+      stub_const('::Trilogy::Result', Class.new)
+      result = double('TrilogyOldResult')
+      raw    = double('TrilogyOldClient')
+      allow(raw).to receive(:query).with('SELECT 1').and_return(result)
+      conn = double('TrilogyConn', open_transactions: 0, raw_connection: raw, mariadb?: false)
+
+      expect(adapter.non_idle_transaction?(conn)).to be(false)
+    end
+
+    it 'fails closed when raw_connection is nil' do
+      conn = double('MysqlDeadConn', open_transactions: 0, raw_connection: nil)
+      expect(adapter.non_idle_transaction?(conn)).to be(true)
+    end
+
     it 'fails closed when default_namespace is blank during reset' do
       conn = double('MysqlConn')
       expect do
@@ -78,6 +93,36 @@ RSpec.describe SchemaShard::DatabaseAdapters do
       expect do
         adapter.format_search_path(['public', 'bad"; DROP TABLE users; --'])
       end.to raise_error(SchemaShard::InvalidTenantError)
+    end
+
+    it 'propagates search_path restoration errors when the block succeeded cleanly' do
+      conn = double('PgConn', schema_search_path: '"public"', clear_cache!: nil)
+      allow(conn).to receive(:schema_search_path=).with('"tenant_a"')
+      allow(conn).to receive(:schema_search_path=).with('"public"').and_raise(StandardError, 'restore failed')
+
+      expect do
+        adapter.switch_namespace(conn, 'tenant_a') { :ok }
+      end.to raise_error(StandardError, 'restore failed')
+    end
+
+    it 'preserves the original in-flight exception if search_path restoration also raises' do
+      conn = double('PgConn', schema_search_path: '"public"', clear_cache!: nil)
+      allow(conn).to receive(:schema_search_path=).with('"tenant_a"')
+      allow(conn).to receive(:schema_search_path=).with('"public"').and_raise(StandardError, 'restore failed')
+
+      expect do
+        adapter.switch_namespace(conn, 'tenant_a') { raise 'original boom' }
+      end.to raise_error(RuntimeError, 'original boom')
+    end
+
+    it 'does not call restore_search_path if initial schema_search_path= setup fails' do
+      conn = double('PgConn', schema_search_path: '"public"')
+      allow(conn).to receive(:schema_search_path=).with('"tenant_a"').and_raise(StandardError, 'socket closed')
+      expect(conn).not_to receive(:schema_search_path=).with('"public"')
+
+      expect do
+        adapter.switch_namespace(conn, 'tenant_a') { :never }
+      end.to raise_error(StandardError, 'socket closed')
     end
   end
 
@@ -108,6 +153,12 @@ RSpec.describe SchemaShard::DatabaseAdapters do
       expect do
         adapter.validate_tenant!('../secret', default_namespace: nil)
       end.to raise_error(SchemaShard::InvalidTenantError)
+    end
+
+    it 'returns nil for default_namespace_for and fails closed when raw_connection is nil' do
+      expect(adapter.default_namespace_for({ 'database' => 'a.sqlite3' }, configured_default: 'public')).to be_nil
+      dead_conn = double('SqliteDeadConn', open_transactions: 0, raw_connection: nil)
+      expect(adapter.non_idle_transaction?(dead_conn)).to be(true)
     end
   end
 

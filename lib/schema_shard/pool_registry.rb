@@ -214,8 +214,9 @@ module SchemaShard
       str_config = resolve_url_options(stringify_keys(config))
       merged     = db_adapter.default_pool_options(@configuration).merge(str_config)
       merged['pool']              = [merged['pool'].to_i, 1].max
-      merged['checkout_timeout']  = merged['checkout_timeout'].to_f
-      merged['reaping_frequency'] = merged['reaping_frequency'].to_f
+      timeout_val                 = merged['checkout_timeout'].to_f
+      merged['checkout_timeout']  = timeout_val.positive? ? timeout_val : @configuration.checkout_timeout.to_f
+      merged['reaping_frequency'] = (merged['reaping_frequency'] || @configuration.reaping_frequency).to_f
       read_only ? db_adapter.apply_read_only_config(merged) : merged
     end
 
@@ -223,9 +224,10 @@ module SchemaShard
       url = str_config['url']
       return str_config if url.nil? || url.to_s.strip.empty?
 
+      require 'active_record' unless defined?(ActiveRecord::DatabaseConfigurations::ConnectionUrlResolver)
       resolved = ActiveRecord::DatabaseConfigurations::ConnectionUrlResolver.new(url.to_s)
                                                                             .to_hash.transform_keys(&:to_s)
-      resolved.merge(str_config.except('url'))
+      resolved.merge(str_config.except('url').compact)
     end
 
     def acquire_under_lock(resolved_config, shard_key, pool_key, db_adapter:, read_only:, now:)
@@ -246,8 +248,7 @@ module SchemaShard
               evicted_pools.concat(lru_evicted)
             end
 
-            evicted = enforce_pool_limit_without_lock!(pool_key)
-            evicted_pools << evicted if evicted
+            evicted_pools.concat(enforce_pool_limit_without_lock!(pool_key))
 
             new_pool  = build_connection_pool(resolved_config, pool_key, db_adapter: db_adapter, read_only: read_only)
             new_entry = PoolEntry.new(pool: new_pool, pool_key: pool_key, shard_key: shard_key, accessed_at: now)
@@ -287,15 +288,16 @@ module SchemaShard
     def resolve_pool_key(config, shard_key, read_only:, per_tenant_pool:)
       return build_pool_key(config, shard_key, read_only: read_only) if per_tenant_pool
 
-      cache_id = "#{shard_key}:#{read_only ? 'ro' : 'rw'}"
+      cache_id = "#{@configuration.effective_env}:#{shard_key}:#{read_only ? 'ro' : 'rw'}"
       @pool_keys_cache.compute_if_absent(cache_id) do
         build_pool_key(config, shard_key, read_only: read_only)
       end
     end
 
     def enforce_pool_limit_without_lock!(pool_key)
-      return nil if @connection_pools.size < @configuration.max_pools
+      return [] if @connection_pools.size < @configuration.max_pools
 
+      evicted_list = []
       sorted_candidates = @connection_pools
                           .each_pair
                           .reject { |k, _| k == pool_key }
@@ -303,12 +305,16 @@ module SchemaShard
                           .map(&:first)
 
       sorted_candidates.each do |candidate_key|
+        break if @connection_pools.size < @configuration.max_pools
+
         evicted = try_evict_pool_without_lock(candidate_key)
-        if evicted
-          logger&.warn "[SchemaShard] Pool limit reached; evicting '#{candidate_key}'"
-          return evicted
-        end
+        next unless evicted
+
+        logger&.warn "[SchemaShard] Pool limit reached; evicting '#{candidate_key}'"
+        evicted_list << evicted
       end
+
+      return evicted_list if @connection_pools.size < @configuration.max_pools
 
       raise PoolLimitExceededError,
             "Connection pool limit (#{@configuration.max_pools}) reached and no idle evictable pool found"

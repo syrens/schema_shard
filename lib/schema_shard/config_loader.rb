@@ -48,12 +48,30 @@ module SchemaShard
     def resolve_url_config(raw_cfg)
       url = raw_cfg['url'] || raw_cfg[:url]
       return raw_cfg if url.nil? || url.to_s.strip.empty?
-      return raw_cfg if url.to_s.include?('%{tenant}')
 
+      if url.to_s.include?('%{tenant}')
+        return raw_cfg if present_value?(raw_cfg['adapter'] || raw_cfg[:adapter])
+
+        scheme = extract_url_adapter(url.to_s)
+        return scheme ? deep_freeze(raw_cfg.transform_keys(&:to_s).merge('adapter' => scheme)) : raw_cfg
+      end
+
+      require 'active_record' unless defined?(ActiveRecord::DatabaseConfigurations::ConnectionUrlResolver)
       resolver_class = ActiveRecord::DatabaseConfigurations::ConnectionUrlResolver
       resolved = resolver_class.new(url.to_s).to_hash.transform_keys(&:to_s)
-      explicit = raw_cfg.transform_keys(&:to_s).except('url')
+      explicit = raw_cfg.transform_keys(&:to_s).except('url').compact
       deep_freeze(resolved.merge(explicit))
+    end
+
+    def extract_url_adapter(url_str)
+      scheme = url_str[/\A([a-z0-9_+-]+):/i, 1]&.downcase
+      return 'postgresql' if scheme == 'postgres'
+
+      scheme
+    end
+
+    def present_value?(val)
+      !val.nil? && !val.to_s.strip.empty?
     end
 
     def load_and_parse

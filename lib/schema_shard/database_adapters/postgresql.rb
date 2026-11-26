@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require 'English'
 require_relative 'base'
 
 module SchemaShard
@@ -37,11 +36,21 @@ module SchemaShard
       def switch_namespace(conn, tenant, persistent_schemas: [], shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
         previous_path  = conn.respond_to?(:schema_search_path) ? conn.schema_search_path : nil
         target_schemas = ([tenant] + Array(persistent_schemas).map(&:to_s)).uniq
+        switched       = false
+        in_flight      = false
+
         conn.schema_search_path = format_search_path(target_schemas)
+        switched = true
         conn.clear_cache! if conn.respond_to?(:clear_cache!)
-        yield
+
+        begin
+          yield
+        rescue Exception # rubocop:disable Lint/RescueException
+          in_flight = true
+          raise
+        end
       ensure
-        restore_search_path(conn, previous_path)
+        restore_search_path(conn, previous_path, suppress_errors: in_flight) if switched
       end
 
       def current_namespace(conn, live: false)
@@ -53,8 +62,8 @@ module SchemaShard
         nil
       end
 
-      def namespace_matches?(conn, expected_tenant, persistent_schemas: [])
-        actual_path = current_namespace(conn, live: false)
+      def namespace_matches?(conn, expected_tenant, persistent_schemas: [], live: false)
+        actual_path = current_namespace(conn, live: live)
         return false if actual_path.nil?
 
         expected = ([expected_tenant] + Array(persistent_schemas).map(&:to_s)).uniq
@@ -117,7 +126,7 @@ module SchemaShard
 
       private
 
-      def restore_search_path(conn, previous_path)
+      def restore_search_path(conn, previous_path, suppress_errors: false)
         return unless previous_path && conn.respond_to?(:schema_search_path=)
 
         conn.schema_search_path = previous_path
@@ -125,7 +134,7 @@ module SchemaShard
       rescue StandardError
         # Do not mask an in-flight exception (e.g. Timeout::Error / PG::InFailedSqlTransaction);
         # ConnectionSanitizer will perform live verification and discard the connection fail-closed.
-        raise unless $ERROR_INFO
+        raise unless suppress_errors
       end
     end
 

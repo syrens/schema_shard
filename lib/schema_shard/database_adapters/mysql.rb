@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require 'English'
 require_relative 'base'
 
 module SchemaShard
@@ -35,27 +34,31 @@ module SchemaShard
       def non_idle_transaction?(conn)
         return true if conn.respond_to?(:open_transactions) && conn.open_transactions.to_i.positive?
 
-        if conn.respond_to?(:raw_connection)
-          raw = conn.raw_connection
-          return raw.server_status.to_i.anybits?(SERVER_STATUS_IN_TRANS) if raw.respond_to?(:server_status)
-        end
+        raw_state = check_raw_transaction_state(conn)
+        return raw_state unless raw_state.nil?
 
-        if conn.respond_to?(:mariadb?) && conn.mariadb? && conn.respond_to?(:select_value)
-          return conn.select_value('SELECT @@in_transaction').to_i.positive?
-        end
-
-        false
+        mariadb_in_transaction?(conn)
       rescue StandardError
         true
       end
 
       def switch_namespace(conn, tenant, persistent_schemas: [], shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
         previous_db = current_namespace(conn, live: true)
+        switched    = false
+        in_flight   = false
+
         use_database!(conn, tenant)
+        switched = true
         conn.clear_cache! if conn.respond_to?(:clear_cache!)
-        yield
+
+        begin
+          yield
+        rescue Exception # rubocop:disable Lint/RescueException
+          in_flight = true
+          raise
+        end
       ensure
-        restore_database(conn, previous_db)
+        restore_database(conn, previous_db, suppress_errors: in_flight) if switched
       end
 
       def current_namespace(conn, live: false)
@@ -67,8 +70,8 @@ module SchemaShard
         nil
       end
 
-      def namespace_matches?(conn, expected_tenant, persistent_schemas: []) # rubocop:disable Lint/UnusedMethodArgument
-        actual = current_namespace(conn, live: false)
+      def namespace_matches?(conn, expected_tenant, persistent_schemas: [], live: false) # rubocop:disable Lint/UnusedMethodArgument
+        actual = current_namespace(conn, live: live)
         !actual.nil? && actual.casecmp?(expected_tenant.to_s)
       end
 
@@ -111,18 +114,37 @@ module SchemaShard
 
       private
 
+      def check_raw_transaction_state(conn)
+        return nil unless conn.respond_to?(:raw_connection)
+
+        raw = conn.raw_connection
+        return true if raw.nil?
+        return raw.server_status.to_i.anybits?(SERVER_STATUS_IN_TRANS) if raw.respond_to?(:server_status)
+        return raw.in_transaction? if raw.respond_to?(:in_transaction?)
+        return nil unless defined?(::Trilogy::Result) && raw.respond_to?(:query)
+
+        res = raw.query('SELECT 1')
+        res.respond_to?(:in_transaction?) ? res.in_transaction? : nil
+      end
+
+      def mariadb_in_transaction?(conn)
+        return false unless conn.respond_to?(:mariadb?) && conn.mariadb? && conn.respond_to?(:select_value)
+
+        conn.select_value('SELECT @@in_transaction').to_i.positive?
+      end
+
       def use_database!(conn, db_name)
         quoted = "`#{db_name.to_s.gsub('`', '``')}`"
         conn.execute("USE #{quoted}")
       end
 
-      def restore_database(conn, previous_db)
+      def restore_database(conn, previous_db, suppress_errors: false)
         return unless present_value?(previous_db)
 
         use_database!(conn, previous_db)
         conn.clear_cache! if conn.respond_to?(:clear_cache!)
       rescue StandardError
-        raise unless $ERROR_INFO
+        raise unless suppress_errors
       end
     end
 

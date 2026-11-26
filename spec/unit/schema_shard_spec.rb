@@ -211,6 +211,20 @@ RSpec.describe SchemaShard do
 
       described_class.with('tenant_a') { :ok }
     end
+
+    it 'marks enclosing outer pool frame dirty when nesting .with inside .on_shard' do
+      observed_dirty = nil
+      described_class.on_shard('shard01') do
+        outer_frame = SchemaShard::ExecutionContext.enclosing_pool_frame(fake_pool)
+        expect(outer_frame[:dirty]).to be(false)
+
+        described_class.with('tenant_a', shard_key: 'shard01') do
+          observed_dirty = outer_frame[:dirty]
+        end
+      end
+
+      expect(observed_dirty).to be(true)
+    end
   end
 
   describe 'read-only enforcement' do
