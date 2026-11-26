@@ -49,9 +49,9 @@ module SchemaShard
 
         use_database!(conn, tenant)
         switched = true
-        conn.clear_cache! if conn.respond_to?(:clear_cache!)
 
         begin
+          conn.clear_cache! if conn.respond_to?(:clear_cache!)
           yield
         rescue Exception # rubocop:disable Lint/RescueException
           in_flight = true

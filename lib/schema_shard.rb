@@ -53,6 +53,7 @@ module SchemaShard
       @pool_registry = nil
       @sanitizer     = nil
       @metrics_store = nil
+      @excluded_models_cache = nil
       configuration
     end
 
@@ -189,7 +190,7 @@ module SchemaShard
     end
 
     def metrics_store
-      @metrics_store ||= Metrics.new
+      @metrics_store ||= Metrics.new(configuration: configuration)
     end
 
     def sanitizer
@@ -278,6 +279,10 @@ module SchemaShard
 
     def with_pool_scope(pool, scope, &block)
       enclosing = ExecutionContext.enclosing_pool_frame(pool)
+      if enclosing&.dig(:tainted)
+        raise TaintedConnectionError, "Cannot open nested block on tainted shard pool '#{scope[:shard_key]}'"
+      end
+
       reentrant = !enclosing.nil?
 
       checkout_connection(pool) do |conn|
@@ -364,7 +369,7 @@ module SchemaShard
     end
 
     def excluded_model?(klass)
-      excluded_set = TenantAdapters.resolve(configuration).excluded_models
+      excluded_set = cached_excluded_models_set
       return false if excluded_set.empty?
 
       klass.ancestors.any? do |ancestor|
@@ -372,15 +377,45 @@ module SchemaShard
       end
     end
 
+    def cached_excluded_models_set
+      apt_excluded = (::Apartment.excluded_models if defined?(::Apartment) && ::Apartment.respond_to?(:excluded_models))
+      cache_key = [
+        configuration.tenant_adapter,
+        configuration.tenant_mode,
+        Array(configuration.excluded_models).dup,
+        apt_excluded ? Array(apt_excluded).dup : nil
+      ]
+      cached = @excluded_models_cache
+      return cached[1] if cached && cached[0] == cache_key
+
+      set = TenantAdapters.resolve(configuration).excluded_models.to_set.freeze
+      @excluded_models_cache = [cache_key, set]
+      set
+    end
+
     def custom_connection_model?(klass)
-      return false unless klass.respond_to?(:connection_class_for_self)
+      if klass.respond_to?(:connection_class_for_self)
+        conn_class = klass.connection_class_for_self
+        return true unless primary_connection_class?(conn_class)
+      end
 
-      conn_class = klass.connection_class_for_self
-      return false if conn_class == ActiveRecord::Base
-      return false if conn_class.respond_to?(:primary_class?) && conn_class.primary_class?
-      return false if defined?(ApplicationRecord) && conn_class == ApplicationRecord
+      return false unless klass.respond_to?(:connection_handler)
 
-      true
+      handler = klass.connection_handler
+      klass.ancestors.any? do |ancestor|
+        next false unless ancestor.is_a?(Class) && ancestor < ActiveRecord::Base && ancestor.name
+        next false if primary_connection_class?(ancestor)
+
+        !handler.retrieve_connection_pool(ancestor.name, strict: false).nil?
+      end
+    end
+
+    def primary_connection_class?(klass)
+      return true if klass == ActiveRecord::Base
+      return true if klass.respond_to?(:primary_class?) && klass.primary_class?
+      return true if defined?(ApplicationRecord) && klass == ApplicationRecord
+
+      false
     end
   end
 end

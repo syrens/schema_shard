@@ -87,7 +87,8 @@ production:
 - **Read-Only Defense in Depth**: `read_only: true` applies both `ActiveRecord::Base.while_preventing_writes` (which prevents writes thread-wide for the duration of the block, including `excluded_models`) and DB-level session read-only flags. In production, always back read replicas with a **read-only database role/user** as well.
 - **Open Transactions & Nested Switches**: Nested different-tenant switches inside an open database transaction are rejected fail-closed (`SchemaShard::TaintedConnectionError`), and the tainted pool frame blocks any further queries even if the error is rescued.
 - **MySQL 8 / Trilogy**: `trilogy >= 2.12.0` is recommended for live `Trilogy::Result#in_transaction?` protocol inspection on MySQL 8; MariaDB automatically uses `@@in_transaction`.
-- **Fast-Path Live Verification**: Set `config.live_verify_fast_path = true` if application code mutates `search_path` or `USE` via raw SQL outside `SchemaShard.with`.
+- **Fast-Path Live Verification**: Set `config.live_verify_fast_path = true` if application code mutates `search_path` or `USE` via raw SQL outside `SchemaShard.with`. Avoid wrapping a nested `SchemaShard.with` inside an out-of-band `Apartment::Tenant.switch` call.
+- **Metrics Cardinality**: Per-shard metrics are bounded by `config.max_tracked_shards` (default `100`, bucketing overflow into `_other`). Call `SchemaShard.reset_metrics!` if you rotate dynamic shard keys.
 - **Fiber Concurrency (Falcon / Async)**: Set `config.active_support.isolation_level = :fiber` in Rails 8 so `ActiveSupport::IsolatedExecutionState` isolates shard context per Fiber.
 - **Standalone / Non-Rails Apps**: Call `SchemaShard.install!` once at boot to prepend `SchemaShard::ConnectionPatch` onto `ActiveRecord::Base`.
 

@@ -39,11 +39,12 @@ module SchemaShard
         switched       = false
         in_flight      = false
 
-        conn.schema_search_path = format_search_path(target_schemas)
+        formatted = format_search_path(target_schemas)
+        apply_search_path!(conn, formatted)
         switched = true
-        conn.clear_cache! if conn.respond_to?(:clear_cache!)
 
         begin
+          conn.clear_cache! if conn.respond_to?(:clear_cache!)
           yield
         rescue Exception # rubocop:disable Lint/RescueException
           in_flight = true
@@ -76,7 +77,7 @@ module SchemaShard
 
         return if actual_path && search_path_matches?(actual_path, expected)
 
-        conn.schema_search_path = format_search_path(expected)
+        apply_search_path!(conn, format_search_path(expected))
       end
 
       def verify_and_reset_default_namespace!(conn, default_namespace:, persistent_schemas: [], live: false)
@@ -86,7 +87,7 @@ module SchemaShard
         raise TaintedConnectionError, 'unverifiable search_path' if actual_path.nil?
         return if search_path_matches?(actual_path, expected)
 
-        conn.schema_search_path = format_search_path(expected)
+        apply_search_path!(conn, format_search_path(expected))
       end
 
       def default_namespace_for(_shard_cfg, configured_default: nil)
@@ -126,10 +127,22 @@ module SchemaShard
 
       private
 
+      # Rails 8's PostgreSQLAdapter#schema_search_path= skips executing SET search_path
+      # when its cached @schema_search_path already equals the target string. Force raw
+      # SET search_path in that case so out-of-band SQL SET search_path mutations are overwritten.
+      def apply_search_path!(conn, formatted)
+        cached = conn.respond_to?(:schema_search_path) ? conn.schema_search_path : nil
+        if cached == formatted && conn.respond_to?(:execute)
+          conn.execute("SET search_path TO #{formatted}")
+        else
+          conn.schema_search_path = formatted
+        end
+      end
+
       def restore_search_path(conn, previous_path, suppress_errors: false)
         return unless previous_path && conn.respond_to?(:schema_search_path=)
 
-        conn.schema_search_path = previous_path
+        apply_search_path!(conn, previous_path)
         conn.clear_cache! if conn.respond_to?(:clear_cache!)
       rescue StandardError
         # Do not mask an in-flight exception (e.g. Timeout::Error / PG::InFailedSqlTransaction);

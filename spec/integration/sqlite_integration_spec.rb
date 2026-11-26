@@ -129,4 +129,45 @@ RSpec.describe 'SQLite3 live integration' do
 
     expect(SchemaShard.on_shard('url_shard') { item_model.pluck(:name) }).to eq(['shard01_item'])
   end
+
+  it 'does NOT hijack a real ActiveRecord connects_to abstract class and its concrete subclass' do
+    queue_db = File.join(tmpdir, 'queue.sqlite3')
+    queue_base = Class.new(ActiveRecord::Base) do
+      self.abstract_class = true
+    end
+    stub_const('SpecQueueBase', queue_base)
+    SpecQueueBase.establish_connection(adapter: 'sqlite3', database: queue_db)
+    SpecQueueBase.connection.create_table(:jobs, force: true) { |t| t.string :title }
+
+    queue_job = Class.new(SpecQueueBase) do
+      self.table_name = 'jobs'
+    end
+    stub_const('SpecQueueJob', queue_job)
+    SpecQueueJob.create!(title: 'dedicated_queue_job')
+
+    SchemaShard.on_shard('shard01') do
+      expect(SchemaShard.routable_model?(SpecQueueBase)).to be(false)
+      expect(SchemaShard.routable_model?(SpecQueueJob)).to be(false)
+      expect(SpecQueueJob.pluck(:title)).to eq(['dedicated_queue_job'])
+      expect(item_model.pluck(:name)).to eq(['shard01_item'])
+    end
+  ensure
+    queue_base&.connection_handler&.clear_all_connections!(:all)
+  end
+
+  it 'keeps parent shard pool healthy after a real Process.fork child discards inherited pools' do
+    skip 'Process.fork not supported on this platform' unless Process.respond_to?(:fork)
+
+    expect(SchemaShard.on_shard('shard01') { item_model.pluck(:name) }).to eq(['shard01_item'])
+    expect(SchemaShard.pool_count).to eq(1)
+
+    pid = Process.fork do
+      SchemaShard.discard_pools_after_fork!
+      exit!(SchemaShard.pool_count.zero? ? 0 : 1)
+    end
+    _, status = Process.wait2(pid)
+
+    expect(status.exitstatus).to eq(0)
+    expect(SchemaShard.on_shard('shard01') { item_model.pluck(:name) }).to eq(['shard01_item'])
+  end
 end

@@ -18,8 +18,8 @@ module SchemaShard
       verify_live     = opts.fetch(:verify_live, false)
 
       if db_adapter.non_idle_transaction?(conn)
-        discard_tainted(pool, conn, shard_key, 'nested non-idle transaction')
         ExecutionContext.mark_pool_frames_tainted(pool)
+        discard_tainted(pool, conn, shard_key, 'nested non-idle transaction')
         raise TaintedConnectionError, "Connection on '#{shard_key}' left in non-idle transaction after nested switch"
       end
 
@@ -41,8 +41,8 @@ module SchemaShard
     rescue TaintedConnectionError
       raise
     rescue StandardError => e
-      discard_tainted(pool, conn, shard_key, "failed to restore outer tenant namespace: #{e.message}")
       ExecutionContext.mark_pool_frames_tainted(pool)
+      discard_tainted(pool, conn, shard_key, "failed to restore outer tenant namespace: #{e.message}")
       raise TaintedConnectionError, "Failed to restore outer tenant namespace on '#{shard_key}': #{e.message}"
     end
 
