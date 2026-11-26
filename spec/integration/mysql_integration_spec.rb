@@ -14,15 +14,16 @@ if ENV['MYSQL_INTEGRATION'] == '1'
     let(:mysql_database) { ENV.fetch('MYSQL_DATABASE', 'schema_shard_test') }
 
     let(:base_mysql_config) do
-      {
+      cfg = {
         'adapter' => mysql_adapter,
         'host' => mysql_host,
         'port' => mysql_port,
         'username' => mysql_user,
         'password' => mysql_password,
-        'database' => mysql_database,
-        'prepared_statements' => true
+        'database' => mysql_database
       }
+      cfg['prepared_statements'] = true if mysql_adapter == 'mysql2'
+      cfg
     end
 
     let(:item_model) do
