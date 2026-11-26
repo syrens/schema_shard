@@ -2,7 +2,7 @@
 
 require 'active_support'
 require 'active_support/isolated_execution_state'
-require 'active_record'
+require 'active_record' unless defined?(Rails::Railtie)
 
 require_relative 'schema_shard/version'
 require_relative 'schema_shard/errors'
@@ -47,6 +47,7 @@ module SchemaShard
     end
 
     def reset_configuration!
+      @pool_registry&.cleanup_connection_pools!
       @configuration = Configuration.new
       @config_loader = nil
       @pool_registry = nil
@@ -56,6 +57,7 @@ module SchemaShard
     end
 
     def install!
+      require 'active_record' unless defined?(ActiveRecord::Base)
       return if ActiveRecord::Base.singleton_class.ancestors.include?(ConnectionPatch)
 
       ActiveRecord::Base.singleton_class.prepend(ConnectionPatch)
@@ -69,12 +71,6 @@ module SchemaShard
       @fork_hook_installed = true
     end
 
-    # Executes a block within a shard (and optionally a tenant schema/database).
-    #
-    # @param tenant       [String, nil] Tenant schema/database name (optional when tenant_mode is :optional or :none)
-    # @param shard_key    [String, Symbol, nil] Key from shards.yml (falls back to configuration.default_shard)
-    # @param allow_public [Boolean] Allow default schema/namespace in :strict mode (default: false)
-    # @param read_only    [Boolean] Enforce read-only replica protections (default: true)
     def with(tenant = nil, shard_key: nil, allow_public: false, read_only: true, &)
       raise ArgumentError, 'Block is required' unless block_given?
 
@@ -102,8 +98,6 @@ module SchemaShard
       )
     end
 
-    # Explicit shard-only routing with NO tenant/schema switching.
-    # Falls back to the shard's default schema/database regardless of tenant_mode.
     def on_shard(shard_key = nil, read_only: true, &)
       raise ArgumentError, 'Block is required' unless block_given?
 
@@ -123,19 +117,18 @@ module SchemaShard
       )
     end
 
-    # Explicitly executes a block against the default (`public`) schema on a shard.
     def with_public(shard_key: nil, read_only: true, &)
-      tenant_adapter = TenantAdapters.resolve(configuration)
-      with(
-        tenant_adapter.default_namespace,
-        shard_key: shard_key,
-        allow_public: true,
-        read_only: read_only,
-        &
-      )
+      raise ArgumentError, 'Block is required' unless block_given?
+
+      normalized_shard = resolve_shard_key!(shard_key)
+      shard_config     = config_loader.fetch!(normalized_shard)
+      db_adapter       = DatabaseAdapters.for(shard_config['adapter'] || shard_config[:adapter])
+      tenant_adapter   = TenantAdapters.resolve(configuration)
+      default_ns       = tenant_adapter.default_namespace(shard_config, db_adapter: db_adapter)
+
+      with(default_ns, shard_key: normalized_shard, allow_public: true, read_only: read_only, &)
     end
 
-    # Execution state readers
     def current_config      = ExecutionContext.current_config
     def current_shard_label = ExecutionContext.current_shard_label
     def current_tenant      = ExecutionContext.current_tenant
@@ -167,30 +160,17 @@ module SchemaShard
       nil
     end
 
-    # Pool management & monitoring API
-    def pool_count               = pool_registry.pool_count
-    def pool_usage_info          = pool_registry.pool_usage_info
-    def pool_statistics          = pool_registry.pool_statistics
-    def total_active_connections = pool_registry.total_active_connections
+    def pool_count                = pool_registry.pool_count
+    def pool_usage_info           = pool_registry.pool_usage_info
+    def pool_statistics           = pool_registry.pool_statistics
+    def total_active_connections  = pool_registry.total_active_connections
     def cleanup_connection_pools! = pool_registry.cleanup_connection_pools!
     def cleanup_unused_pools!     = pool_registry.cleanup_unused_pools!
 
-    # Observability API
-    def metrics
-      metrics_store.snapshot(pool_status: pool_registry.pool_status_snapshot)
-    end
-
-    def prometheus_metrics
-      metrics_store.prometheus(pool_status: pool_registry.pool_status_snapshot)
-    end
-
-    def statsd_metrics
-      metrics_store.statsd(pool_status: pool_registry.pool_status_snapshot)
-    end
-
-    def reset_metrics!
-      metrics_store.reset!
-    end
+    def metrics            = metrics_store.snapshot(pool_status: pool_registry.pool_status_snapshot)
+    def prometheus_metrics = metrics_store.prometheus(pool_status: pool_registry.pool_status_snapshot)
+    def statsd_metrics     = metrics_store.statsd(pool_status: pool_registry.pool_status_snapshot)
+    def reset_metrics!     = metrics_store.reset!
 
     def increment_metric(metric_name, count = 1)
       metrics_store.increment(metric_name, count)
@@ -200,7 +180,6 @@ module SchemaShard
       metrics_store.increment_shard(shard_key, metric_name, count)
     end
 
-    # Internal collaborators (accessible for testing)
     def config_loader
       @config_loader ||= ConfigLoader.new(configuration: configuration)
     end
@@ -220,30 +199,29 @@ module SchemaShard
     private
 
     def execute_in_shard(shard_key:, shard_config:, tenant:, db_adapter:, tenant_adapter:, read_only:, &block)
-      if same_active_context?(shard_key, tenant, read_only, tenant_adapter, db_adapter)
+      if same_active_context?(shard_key, shard_config, tenant, read_only, tenant_adapter, db_adapter)
         metrics_store.track_switch(shard_key)
         return yield
       end
 
       metrics_store.track_switch(shard_key)
-      entry        = pool_registry.acquire(shard_config, shard_key, db_adapter: db_adapter,
-                                                                    read_only: read_only, tenant: tenant)
-      outer_tenant = ExecutionContext.current_tenant
+      entry = nil
 
       begin
+        entry = pool_registry.acquire(shard_config, shard_key, db_adapter: db_adapter,
+                                                               read_only: read_only, tenant: tenant)
         with_read_only_guard(read_only) do
           ExecutionContext.with_context(shard_key: shard_key, config: shard_config,
                                         tenant: tenant, read_only: read_only) do
             scope = {
               shard_key: shard_key, shard_config: shard_config, tenant: tenant,
-              outer_tenant: outer_tenant, db_adapter: db_adapter,
-              tenant_adapter: tenant_adapter, read_only: read_only
+              db_adapter: db_adapter, tenant_adapter: tenant_adapter, read_only: read_only
             }
             with_pool_scope(entry.pool, scope, &block)
           end
         end
       ensure
-        entry.release
+        entry&.release
       end
     end
 
@@ -258,7 +236,6 @@ module SchemaShard
 
     def resolve_tenant!(tenant, shard_config:, db_adapter:, tenant_adapter:, allow_public:)
       return nil unless tenant_adapter.switches_tenant?
-
       return nil if tenant.nil? && configuration.tenant_mode == :optional
 
       effective_allow_public = allow_public || configuration.tenant_mode == :optional
@@ -267,16 +244,17 @@ module SchemaShard
       db_adapter.validate_tenant!(tenant, default_namespace: default_ns, allow_public: effective_allow_public)
     end
 
-    def same_active_context?(shard_key, tenant, read_only, tenant_adapter, db_adapter)
+    def same_active_context?(shard_key, shard_config, tenant, read_only, tenant_adapter, db_adapter)
       conn = ExecutionContext.active_connection
       return false if conn.nil?
       return false unless ExecutionContext.current_shard_label == shard_key
+      return false unless ExecutionContext.current_config == shard_config
       return false unless ExecutionContext.current_tenant == tenant
       return false unless ExecutionContext.read_only? == read_only
 
-      if tenant && tenant_adapter.switches_tenant?
-        live_current = tenant_adapter.current(conn: conn, db_adapter: db_adapter)
-        return false if live_current && live_current.to_s != tenant
+      if tenant && tenant_adapter.switches_tenant? &&
+         !tenant_adapter.matches_current?(tenant, conn: conn, db_adapter: db_adapter)
+        return false
       end
 
       true
@@ -285,19 +263,20 @@ module SchemaShard
     def with_read_only_guard(read_only, &)
       if read_only && ActiveRecord::Base.respond_to?(:while_preventing_writes)
         ActiveRecord::Base.while_preventing_writes(&)
+      elsif !read_only && ExecutionContext.read_only? == true
+        raise ConfigurationError, 'Cannot open a writable shard block (read_only: false) inside a read-only block'
       else
         yield
       end
     end
 
     def with_pool_scope(pool, scope, &block)
-      prev_conn = ExecutionContext.active_connection
-      prev_pool = ExecutionContext.active_pool
+      enclosing = ExecutionContext.enclosing_pool_frame(pool)
+      reentrant = !enclosing.nil?
 
-      pool.with_connection do |conn|
+      checkout_connection(pool) do |conn|
         metrics_store.increment(:connection_checkouts_total)
-        reentrant = prev_conn.equal?(conn) && prev_pool.equal?(pool)
-        run_on_connection(pool, conn, scope, reentrant: reentrant, &block)
+        run_on_connection(pool, conn, scope, enclosing: enclosing, reentrant: reentrant, &block)
       end
     rescue ActiveRecord::ConnectionTimeoutError => e
       metrics_store.increment(:connection_timeouts_total)
@@ -310,16 +289,29 @@ module SchemaShard
       raise
     end
 
-    def run_on_connection(pool, conn, scope, reentrant:, &block)
+    def checkout_connection(pool, &)
+      params = pool.method(:with_connection).parameters
+      if params.any? { |type, name| type == :key && name == :prevent_permanent_checkout }
+        pool.with_connection(prevent_permanent_checkout: true, &)
+      else
+        pool.with_connection(&)
+      end
+    end
+
+    def run_on_connection(pool, conn, scope, enclosing:, reentrant:, &block)
       block_raised    = false
       tenant_switched = !scope[:tenant].nil? && scope[:tenant_adapter].switches_tenant?
+      frame           = ExecutionContext.push_pool_frame(pool, tenant: scope[:tenant], tenant_switched: tenant_switched)
+      ExecutionContext.mark_enclosing_pool_dirty(pool) if reentrant && tenant_switched
 
       begin
         scope[:db_adapter].prepare_connection(conn, read_only: scope[:read_only])
         ExecutionContext.with_connection(conn, pool) do
           sanitizer.clear_query_cache!(pool, conn)
           if tenant_switched
-            scope[:tenant_adapter].switch(scope[:tenant], conn: conn, db_adapter: scope[:db_adapter], &block)
+            scope[:tenant_adapter].switch(
+              scope[:tenant], conn: conn, db_adapter: scope[:db_adapter], shard_config: scope[:shard_config], &block
+            )
           else
             yield
           end
@@ -328,19 +320,24 @@ module SchemaShard
         block_raised = true
         raise
       ensure
-        cleanup_after_connection(pool, conn, scope, reentrant: reentrant,
-                                                    tenant_switched: tenant_switched, block_raised: block_raised)
+        ExecutionContext.pop_pool_frame(pool)
+        cleanup_after_connection(
+          pool, conn, scope,
+          enclosing: enclosing, reentrant: reentrant,
+          tenant_switched: tenant_switched || frame[:dirty], block_raised: block_raised
+        )
+        pool.release_connection if !reentrant && pool.respond_to?(:release_connection)
       end
     end
 
-    def cleanup_after_connection(pool, conn, scope, reentrant:, tenant_switched:, block_raised:)
-      sanitizer.clear_query_cache!(pool, conn)
+    def cleanup_after_connection(pool, conn, scope, enclosing:, reentrant:, tenant_switched:, block_raised:)
       if reentrant
+        sanitizer.clear_query_cache!(pool, conn)
         sanitizer.verify_nested_clean!(
           pool, conn,
           shard_key: scope[:shard_key], db_adapter: scope[:db_adapter],
-          tenant_adapter: scope[:tenant_adapter], outer_tenant: scope[:outer_tenant],
-          verify_live: block_raised
+          tenant_adapter: scope[:tenant_adapter], shard_config: scope[:shard_config],
+          outer_tenant: enclosing[:tenant], tenant_switched: tenant_switched, verify_live: block_raised
         )
       else
         sanitizer.sanitize_before_checkin(
@@ -362,8 +359,12 @@ module SchemaShard
     end
 
     def custom_connection_model?(klass)
-      return false unless klass.respond_to?(:connection_class?) && klass.connection_class?
-      return false if defined?(ApplicationRecord) && klass == ApplicationRecord
+      return false unless klass.respond_to?(:connection_class_for_self)
+
+      conn_class = klass.connection_class_for_self
+      return false if conn_class == ActiveRecord::Base
+      return false if conn_class.respond_to?(:primary_class?) && conn_class.primary_class?
+      return false if defined?(ApplicationRecord) && conn_class == ApplicationRecord
 
       true
     end

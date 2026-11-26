@@ -29,21 +29,23 @@ RSpec.describe SchemaShard::ConfigLoader do
     end
   end
 
-  it 'supports custom config_root_key for legacy YAML layouts' do
+  it 'supports custom config_root_key and resolves url: into adapter/host/database' do
     Tempfile.create(['shards', '.yml']) do |f|
       f.write(<<~YAML)
-        szShards:
+        custom_shards:
           test:
             shard01:
-              adapter: postgresql
-              url: postgres://localhost/app_test
+              url: postgres://readonly_user:secret@replica.internal:5432/app_test
       YAML
       f.flush
 
       configuration.config_path     = f.path
-      configuration.config_root_key = 'szShards'
+      configuration.config_root_key = 'custom_shards'
       cfg = loader.fetch!('shard01')
-      expect(cfg['url']).to eq('postgres://localhost/app_test')
+      expect(cfg['adapter']).to eq('postgresql')
+      expect(cfg['host']).to eq('replica.internal')
+      expect(cfg['database']).to eq('app_test')
+      expect(cfg['username']).to eq('readonly_user')
     end
   end
 

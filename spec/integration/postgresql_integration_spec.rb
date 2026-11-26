@@ -51,7 +51,12 @@ if ENV['PG_INTEGRATION'] == '1'
         config.default_shard  = 'pg_shard'
         config.tenant_adapter = :native
         config.tenant_mode    = :strict
-        config.shards         = { 'test' => { 'pg_shard' => base_pg_config } }
+        config.shards         = {
+          'test' => {
+            'pg_shard' => base_pg_config,
+            'pg_shard_2' => base_pg_config.merge('checkout_timeout' => 6)
+          }
+        }
       end
     end
 
@@ -81,6 +86,45 @@ if ENV['PG_INTEGRATION'] == '1'
       end
 
       expect(observed).to eq([['acme_row'], ['globex_row'], ['acme_row']])
+    end
+
+    it 'preserves outer shard schema across A -> B -> A cross-shard nesting' do
+      observed = []
+
+      SchemaShard.with('tenant_acme', shard_key: 'pg_shard') do
+        observed << item_model.pluck(:name)
+        SchemaShard.with('tenant_globex', shard_key: 'pg_shard_2') do
+          observed << item_model.pluck(:name)
+          SchemaShard.with('tenant_globex', shard_key: 'pg_shard') do
+            observed << item_model.pluck(:name)
+          end
+        end
+        observed << item_model.pluck(:name)
+      end
+
+      expect(observed).to eq([['acme_row'], ['globex_row'], ['globex_row'], ['acme_row']])
+    end
+
+    it 'restores public schema when nesting .with inside .on_shard' do
+      observed = []
+
+      SchemaShard.on_shard('pg_shard') do
+        observed << item_model.pluck(:name)
+        SchemaShard.with('tenant_acme', shard_key: 'pg_shard') do
+          observed << item_model.pluck(:name)
+        end
+        observed << item_model.pluck(:name)
+      end
+
+      expect(observed).to eq([['public_row'], ['acme_row'], ['public_row']])
+      expect(SchemaShard.on_shard('pg_shard') { item_model.pluck(:name) }).to eq(['public_row'])
+    end
+
+    it 're-switches schema when search_path was changed out-of-band inside a block' do
+      SchemaShard.with('tenant_acme') do
+        ActiveRecord::Base.connection.schema_search_path = '"tenant_globex"'
+        expect(SchemaShard.with('tenant_acme') { item_model.pluck(:name) }).to eq(['acme_row'])
+      end
     end
 
     it 'supports shard-only routing (.on_shard) and explicit .with_public' do

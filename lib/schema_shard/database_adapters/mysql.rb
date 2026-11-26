@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'English'
 require_relative 'base'
 
 module SchemaShard
@@ -7,6 +8,11 @@ module SchemaShard
     class Mysql < Base
       VALID_MYSQL_DB_REGEX = /\A[a-zA-Z_][a-zA-Z0-9_-]{0,63}\z/
       FORBIDDEN_DATABASES  = %w[mysql information_schema performance_schema sys].freeze
+      SERVER_STATUS_IN_TRANS = 0x0001
+
+      def supports_namespaces?
+        true
+      end
 
       def default_pool_options(configuration)
         {
@@ -29,9 +35,13 @@ module SchemaShard
       def non_idle_transaction?(conn)
         return true if conn.respond_to?(:open_transactions) && conn.open_transactions.to_i.positive?
 
-        if conn.respond_to?(:select_value)
-          in_tx = conn.select_value('SELECT @@in_transaction').to_i
-          return in_tx.positive?
+        if conn.respond_to?(:raw_connection)
+          raw = conn.raw_connection
+          return raw.server_status.to_i.anybits?(SERVER_STATUS_IN_TRANS) if raw.respond_to?(:server_status)
+        end
+
+        if conn.respond_to?(:mariadb?) && conn.mariadb? && conn.respond_to?(:select_value)
+          return conn.select_value('SELECT @@in_transaction').to_i.positive?
         end
 
         false
@@ -39,17 +49,17 @@ module SchemaShard
         true
       end
 
-      def switch_namespace(conn, tenant, persistent_schemas: []) # rubocop:disable Lint/UnusedMethodArgument
+      def switch_namespace(conn, tenant, persistent_schemas: [], shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
         previous_db = current_namespace(conn, live: true)
         use_database!(conn, tenant)
+        conn.clear_cache! if conn.respond_to?(:clear_cache!)
         yield
       ensure
-        use_database!(conn, previous_db) if present_value?(previous_db)
+        restore_database(conn, previous_db)
       end
 
       def current_namespace(conn, live: false)
         return conn.select_value('SELECT DATABASE()')&.to_s if live && conn.respond_to?(:select_value)
-
         return conn.current_database.to_s if conn.respond_to?(:current_database)
 
         nil
@@ -57,19 +67,26 @@ module SchemaShard
         nil
       end
 
+      def namespace_matches?(conn, expected_tenant, persistent_schemas: []) # rubocop:disable Lint/UnusedMethodArgument
+        actual = current_namespace(conn, live: false)
+        !actual.nil? && actual.casecmp?(expected_tenant.to_s)
+      end
+
       def verify_and_restore_namespace!(conn, expected_tenant:, persistent_schemas: [], live: false) # rubocop:disable Lint/UnusedMethodArgument
         actual = current_namespace(conn, live: live)
-        return if actual == expected_tenant
+        return if actual&.casecmp?(expected_tenant.to_s)
 
         use_database!(conn, expected_tenant)
       end
 
       def verify_and_reset_default_namespace!(conn, default_namespace:, persistent_schemas: [], live: false) # rubocop:disable Lint/UnusedMethodArgument
-        return unless present_value?(default_namespace)
+        unless present_value?(default_namespace)
+          raise TaintedConnectionError, 'cannot reset MySQL database: default_namespace is blank'
+        end
 
         actual = current_namespace(conn, live: live)
         raise TaintedConnectionError, 'unverifiable MySQL database' if actual.nil?
-        return if actual == default_namespace
+        return if actual.casecmp?(default_namespace.to_s)
 
         use_database!(conn, default_namespace)
       end
@@ -97,6 +114,15 @@ module SchemaShard
       def use_database!(conn, db_name)
         quoted = "`#{db_name.to_s.gsub('`', '``')}`"
         conn.execute("USE #{quoted}")
+      end
+
+      def restore_database(conn, previous_db)
+        return unless present_value?(previous_db)
+
+        use_database!(conn, previous_db)
+        conn.clear_cache! if conn.respond_to?(:clear_cache!)
+      rescue StandardError
+        raise unless $ERROR_INFO
       end
     end
 

@@ -31,20 +31,38 @@ module SchemaShard
       end
 
       def per_tenant_pool?(shard_cfg)
-        db = (shard_cfg['database'] || shard_cfg[:database]).to_s
-        db.include?('%{tenant}')
+        return false unless shard_cfg.is_a?(Hash)
+
+        db  = (shard_cfg['database'] || shard_cfg[:database]).to_s
+        url = (shard_cfg['url'] || shard_cfg[:url]).to_s
+        db.include?('%{tenant}') || url.include?('%{tenant}')
       end
 
       def resolve_shard_config(shard_cfg, tenant: nil)
         return shard_cfg unless per_tenant_pool?(shard_cfg)
 
-        unless present_value?(tenant)
-          raise InvalidTenantError, 'SQLite per-tenant database template requires a tenant name'
+        tenant_str = tenant.to_s.strip
+        unless present_value?(tenant_str) && valid_tenant_identifier?(tenant_str)
+          raise InvalidTenantError,
+                "SQLite per-tenant database template requires a valid tenant name (got #{tenant.inspect})"
         end
 
         updated = shard_cfg.transform_keys(&:to_s)
-        updated['database'] = updated['database'].gsub('%{tenant}', tenant.to_s)
+        updated['database'] = updated['database'].gsub('%{tenant}') { tenant_str } if updated['database']
+        updated['url']      = updated['url'].gsub('%{tenant}') { tenant_str } if updated['url']
         updated
+      end
+
+      # SQLite isolates tenants via per-tenant database files (%{tenant} template).
+      # Fail closed if a tenant is requested on a shared non-template SQLite shard.
+      def switch_namespace(_conn, _tenant, persistent_schemas: [], shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
+        unless per_tenant_pool?(shard_config)
+          raise ConfigurationError,
+                "SQLite shard does not use a '%{tenant}' database template; " \
+                'use SchemaShard.on_shard for shard-only routing or configure a per-tenant template'
+        end
+
+        yield
       end
 
       def non_idle_transaction?(conn)

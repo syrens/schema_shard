@@ -32,12 +32,17 @@ module SchemaShard
         true
       end
 
-      def switch(_tenant, conn:, db_adapter:) # rubocop:disable Lint/UnusedMethodArgument
+      def switch(_tenant, conn:, db_adapter:, shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
         yield
       end
 
       def current(conn:, db_adapter:) # rubocop:disable Lint/UnusedMethodArgument
         nil
+      end
+
+      def matches_current?(tenant, conn:, db_adapter:)
+        live = current(conn: conn, db_adapter: db_adapter)
+        live.nil? || live.to_s == tenant.to_s
       end
 
       def default_namespace(shard_config = nil, db_adapter: nil)

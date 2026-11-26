@@ -11,12 +11,16 @@ module SchemaShard
           shard = SchemaShard.current_shard_label
           next unless shard
 
+          active_conn = SchemaShard.active_connection
+          next if payload.key?(:connection) && active_conn && !payload[:connection].equal?(active_conn)
+
           log = logger || SchemaShard.configuration.effective_logger
           next unless log
 
           tenant = SchemaShard.current_tenant
           tag = tenant ? "Shard: #{shard} | Tenant: #{tenant}" : "Shard: #{shard}"
-          log.info("\e[33m==[#{tag}] #{payload[:name]} -> #{payload[:sql]}\e[0m")
+          message = format_message(tag, payload[:name], payload[:sql])
+          log.debug(message)
         end
       end
 
@@ -25,6 +29,19 @@ module SchemaShard
 
         ActiveSupport::Notifications.unsubscribe(@subscriber)
         @subscriber = nil
+      end
+
+      private
+
+      def format_message(tag, name, sql)
+        line = "==[#{tag}] #{name} -> #{sql}"
+        return "\e[33m#{line}\e[0m" if colorize?
+
+        line
+      end
+
+      def colorize?
+        defined?(ActiveSupport::LogSubscriber) && ActiveSupport::LogSubscriber.colorize_logging
       end
     end
   end

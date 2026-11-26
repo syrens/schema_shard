@@ -41,10 +41,43 @@ RSpec.describe SchemaShard::DatabaseAdapters do
     it 'switches MySQL database using USE and restores previous database' do
       conn = double('MysqlConn')
       allow(conn).to receive(:select_value).with('SELECT DATABASE()').and_return('app_main')
+      allow(conn).to receive(:clear_cache!)
       expect(conn).to receive(:execute).with('USE `tenant_acme`').ordered
       expect(conn).to receive(:execute).with('USE `app_main`').ordered
 
       adapter.switch_namespace(conn, 'tenant_acme') { :ok }
+    end
+
+    it 'does not query MariaDB-only @@in_transaction on MySQL 8 connections' do
+      raw  = double('TrilogyClient', server_status: 0)
+      conn = double('Mysql8Conn', open_transactions: 0, raw_connection: raw, mariadb?: false)
+      expect(conn).not_to receive(:select_value)
+
+      expect(adapter.non_idle_transaction?(conn)).to be(false)
+    end
+
+    it 'detects open transaction via SERVER_STATUS_IN_TRANS flag' do
+      raw  = double('TrilogyClient', server_status: 0x0001)
+      conn = double('Mysql8Conn', open_transactions: 0, raw_connection: raw, mariadb?: false)
+
+      expect(adapter.non_idle_transaction?(conn)).to be(true)
+    end
+
+    it 'fails closed when default_namespace is blank during reset' do
+      conn = double('MysqlConn')
+      expect do
+        adapter.verify_and_reset_default_namespace!(conn, default_namespace: '')
+      end.to raise_error(SchemaShard::TaintedConnectionError)
+    end
+  end
+
+  describe SchemaShard::DatabaseAdapters::Postgresql do
+    subject(:adapter) { described_class.instance }
+
+    it 'rejects invalid schema identifiers in format_search_path' do
+      expect do
+        adapter.format_search_path(['public', 'bad"; DROP TABLE users; --'])
+      end.to raise_error(SchemaShard::InvalidTenantError)
     end
   end
 
@@ -64,10 +97,27 @@ RSpec.describe SchemaShard::DatabaseAdapters do
       expect(resolved['database']).to eq('storage/tenants/acme.sqlite3')
     end
 
+    it 'fails closed when switching tenants on a non-template SQLite shard' do
+      cfg = { 'adapter' => 'sqlite3', 'database' => 'storage/shared.sqlite3' }
+      expect do
+        adapter.switch_namespace(double('Conn'), 'acme', shard_config: cfg) { :never }
+      end.to raise_error(SchemaShard::ConfigurationError)
+    end
+
     it 'rejects path traversal in SQLite tenant names' do
       expect do
         adapter.validate_tenant!('../secret', default_namespace: nil)
       end.to raise_error(SchemaShard::InvalidTenantError)
+    end
+  end
+
+  describe SchemaShard::DatabaseAdapters::Generic do
+    subject(:adapter) { described_class.instance }
+
+    it 'fails closed on switch_namespace' do
+      expect do
+        adapter.switch_namespace(double('Conn'), 'acme') { :never }
+      end.to raise_error(SchemaShard::ConfigurationError)
     end
   end
 end

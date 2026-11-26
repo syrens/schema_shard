@@ -5,7 +5,7 @@ require_relative 'base'
 module SchemaShard
   module TenantAdapters
     class Apartment < Base
-      def switch(tenant, conn:, db_adapter:, &) # rubocop:disable Lint/UnusedMethodArgument
+      def switch(tenant, conn:, db_adapter:, shard_config: nil, &) # rubocop:disable Lint/UnusedMethodArgument
         ::Apartment::Tenant.switch(tenant, &)
       end
 
@@ -13,6 +13,10 @@ module SchemaShard
         return nil unless defined?(::Apartment::Tenant) && ::Apartment::Tenant.respond_to?(:current)
 
         ::Apartment::Tenant.current.to_s
+      end
+
+      def matches_current?(tenant, conn:, db_adapter:)
+        super && db_adapter.namespace_matches?(conn, tenant, persistent_schemas: persistent_schemas)
       end
 
       def default_namespace(shard_config = nil, db_adapter: nil)

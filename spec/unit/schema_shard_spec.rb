@@ -35,7 +35,7 @@ RSpec.describe SchemaShard do
       clear_query_cache: nil,
       remove: nil,
       disconnect!: nil,
-      discard_pool!: nil
+      discard!: nil
     ).tap do |p|
       allow(p).to receive(:with_connection) { |&blk| blk.call(fake_conn) }
       allow(p).to receive(:db_config).and_return(
@@ -143,15 +143,21 @@ RSpec.describe SchemaShard do
       expect(described_class.routable_model?(Account)).to be(false)
     end
 
-    it 'does NOT hijack models with their own connection_class?' do
-      custom_model = Class.new(ActiveRecord::Base) do
+    it 'does NOT hijack models inheriting from a connects_to / custom connection abstract class' do
+      custom_abstract = Class.new(ActiveRecord::Base) do
         self.abstract_class = true
-        def self.connection_class?
-          true
+        def self.connection_class_for_self
+          self
+        end
+      end
+      concrete_subclass = Class.new(custom_abstract) do
+        def self.connection_class_for_self
+          superclass
         end
       end
 
-      expect(described_class.routable_model?(custom_model)).to be(false)
+      expect(described_class.routable_model?(custom_abstract)).to be(false)
+      expect(described_class.routable_model?(concrete_subclass)).to be(false)
     end
   end
 
@@ -229,21 +235,30 @@ RSpec.describe SchemaShard do
       vars = captured_pool_config.db_config.configuration_hash[:variables]
       expect(vars['default_transaction_read_only']).to eq('on')
     end
+    it 'refuses to escalate from read_only: true to read_only: false in a nested block' do
+      expect do
+        described_class.with('tenant_a', read_only: true) do
+          described_class.with('tenant_a', read_only: false) { :never }
+        end
+      end.to raise_error(SchemaShard::ConfigurationError)
+    end
   end
 
   describe 'pool registry, eviction concurrency, and fork safety' do
-    it 'produces distinct opaque pool keys when database, username, or variables differ' do
-      cfg_a = { 'host' => 'db1', 'database' => 'app_tenant_1', 'username' => 'ro1' }
-      cfg_b = { 'host' => 'db1', 'database' => 'app_tenant_2', 'username' => 'ro1' }
-      cfg_c = { 'host' => 'db1', 'database' => 'app_tenant_1', 'username' => 'ro2' }
+    it 'produces distinct opaque pool keys when database, username, password, or variables differ' do
+      cfg_a = { 'host' => 'db1', 'database' => 'app_tenant_1', 'username' => 'ro1', 'password' => 'secret_a' }
+      cfg_b = { 'host' => 'db1', 'database' => 'app_tenant_2', 'username' => 'ro1', 'password' => 'secret_a' }
+      cfg_c = { 'host' => 'db1', 'database' => 'app_tenant_1', 'username' => 'ro2', 'password' => 'secret_a' }
+      cfg_d = { 'host' => 'db1', 'database' => 'app_tenant_1', 'username' => 'ro1', 'password' => 'secret_b' }
 
       key_a = described_class.pool_registry.build_pool_key(cfg_a, 'shard01', read_only: true)
       key_b = described_class.pool_registry.build_pool_key(cfg_b, 'shard01', read_only: true)
       key_c = described_class.pool_registry.build_pool_key(cfg_c, 'shard01', read_only: true)
+      key_d = described_class.pool_registry.build_pool_key(cfg_d, 'shard01', read_only: true)
 
-      expect([key_a, key_b, key_c].uniq.size).to eq(3)
+      expect([key_a, key_b, key_c, key_d].uniq.size).to eq(4)
       expect(key_a).not_to include('db1')
-      expect(key_a).not_to include('app_tenant_1')
+      expect(key_a).not_to include('secret_a')
     end
 
     it 'never evicts a pool while concurrent threads are actively using it' do
@@ -276,10 +291,11 @@ RSpec.describe SchemaShard do
       expect(errors).to be_empty
     end
 
-    it 'discards inherited pools after fork via discard_pools_after_fork!' do
+    it 'discards inherited pools after fork via ConnectionPool#discard! without calling disconnect!' do
       described_class.with('tenant_a') { :ok }
       expect(described_class.pool_count).to eq(1)
-      expect(fake_pool).to receive(:discard_pool!)
+      expect(fake_pool).to receive(:discard!)
+      expect(fake_pool).not_to receive(:disconnect!)
 
       described_class.discard_pools_after_fork!
       expect(described_class.pool_count).to eq(0)

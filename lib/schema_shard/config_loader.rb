@@ -18,11 +18,12 @@ module SchemaShard
 
       raise ArgumentError, "Environment '#{env_name}' not found in shard configuration" unless env_config.is_a?(Hash)
 
-      shard_cfg = env_config[shard_key.to_s] || env_config[shard_key.to_sym]
-      unless shard_cfg.is_a?(Hash)
+      raw_cfg = env_config[shard_key.to_s] || env_config[shard_key.to_sym]
+      unless raw_cfg.is_a?(Hash)
         raise ArgumentError, "Shard '#{shard_key}' not found in shard configuration for environment '#{env_name}'"
       end
 
+      shard_cfg  = resolve_url_config(raw_cfg)
       db_adapter = DatabaseAdapters.for(shard_cfg['adapter'] || shard_cfg[:adapter])
       db_adapter.validate_config!(shard_key, shard_cfg)
       shard_cfg
@@ -43,6 +44,17 @@ module SchemaShard
     end
 
     private
+
+    def resolve_url_config(raw_cfg)
+      url = raw_cfg['url'] || raw_cfg[:url]
+      return raw_cfg if url.nil? || url.to_s.strip.empty?
+      return raw_cfg if url.to_s.include?('%{tenant}')
+
+      resolver_class = ActiveRecord::DatabaseConfigurations::ConnectionUrlResolver
+      resolved = resolver_class.new(url.to_s).to_hash.transform_keys(&:to_s)
+      explicit = raw_cfg.transform_keys(&:to_s).except('url')
+      deep_freeze(resolved.merge(explicit))
+    end
 
     def load_and_parse
       if @configuration.shards

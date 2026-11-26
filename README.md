@@ -42,7 +42,7 @@ bin/rails generate schema_shard:install
 # config/initializers/schema_shard.rb
 SchemaShard.configure do |config|
   config.config_path        = Rails.root.join('config', 'shards.yml')
-  config.config_root_key    = nil        # optional top-level YAML key (e.g. 'szShards')
+  config.config_root_key    = nil        # optional top-level YAML key if your file nests shards under a key
   config.default_shard      = 'shard01'
 
   # :auto (Apartment if loaded, else :native), :apartment, :native, :none, or custom adapter
@@ -61,6 +61,32 @@ SchemaShard.configure do |config|
   config.log_shard_queries  = Rails.env.development?
 end
 ```
+
+### Example `config/shards.yml`
+
+```yaml
+production:
+  pg_replica:
+    adapter: postgresql
+    url: <%= ENV['PG_REPLICA_URL'] %>
+
+  mysql_replica:
+    adapter: trilogy
+    host: mysql-replica.internal
+    database: app_production
+    username: readonly_user
+    password: <%= ENV['MYSQL_REPLICA_PASSWORD'] %>
+
+  sqlite_tenants:
+    adapter: sqlite3
+    database: storage/tenants/%{tenant}.sqlite3
+```
+
+### Production Notes
+
+- **Read-Only Defense in Depth**: `read_only: true` applies both `ActiveRecord::Base.while_preventing_writes` (which prevents writes thread-wide for the duration of the block, including `excluded_models`) and DB-level session read-only flags. In production, always back read replicas with a **read-only database role/user** as well.
+- **Fiber Concurrency (Falcon / Async)**: Set `config.active_support.isolation_level = :fiber` in Rails 8 so `ActiveSupport::IsolatedExecutionState` isolates shard context per Fiber.
+- **Standalone / Non-Rails Apps**: Call `SchemaShard.install!` once at boot to prepend `SchemaShard::ConnectionPatch` onto `ActiveRecord::Base`.
 
 ## Usage
 

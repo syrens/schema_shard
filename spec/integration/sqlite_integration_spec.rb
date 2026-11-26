@@ -95,4 +95,38 @@ RSpec.describe 'SQLite3 live integration' do
     expect(globex_items).to eq(['globex_item'])
     expect(SchemaShard.pool_count).to eq(2)
   end
+
+  it 'fails closed when calling .with(tenant) on a non-template SQLite shard' do
+    expect do
+      SchemaShard.with('acme', shard_key: 'shard01') { item_model.pluck(:name) }
+    end.to raise_error(SchemaShard::ConfigurationError)
+  end
+
+  it 'prevents sticky-lease leaks when Rails 8 lease_connection / retrieve_connection are used inside a block' do
+    SchemaShard.configuration.shards = {
+      'test' => {
+        'shard01' => { 'adapter' => 'sqlite3', 'database' => shard_db, 'pool' => 1 }
+      }
+    }
+    SchemaShard.reload_config!
+
+    SchemaShard.on_shard('shard01') do
+      expect(item_model.lease_connection).to equal(SchemaShard.active_connection)
+      expect(item_model.retrieve_connection).to equal(SchemaShard.active_connection)
+      expect(item_model.pluck(:name)).to eq(['shard01_item'])
+    end
+
+    expect(SchemaShard.total_active_connections).to eq(0)
+  end
+
+  it 'supports url:-configured SQLite shards end-to-end' do
+    SchemaShard.configuration.shards = {
+      'test' => {
+        'url_shard' => { 'url' => "sqlite3://#{shard_db}" }
+      }
+    }
+    SchemaShard.reload_config!
+
+    expect(SchemaShard.on_shard('url_shard') { item_model.pluck(:name) }).to eq(['shard01_item'])
+  end
 end

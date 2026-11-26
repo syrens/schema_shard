@@ -4,15 +4,16 @@ module SchemaShard
   class Configuration
     VALID_TENANT_MODES = %i[strict optional none].freeze
 
-    attr_accessor :config_path, :config_root_key, :shards, :default_shard,
+    attr_accessor :config_root_key, :shards, :default_shard,
                   :tenant_adapter, :default_schema, :persistent_schemas,
                   :excluded_models, :default_pool_size, :checkout_timeout,
                   :reaping_frequency, :logger, :env, :log_shard_queries,
                   :auto_fork_safety
+    attr_writer :config_path
     attr_reader :tenant_mode, :max_pools, :cleanup_threshold
 
     def initialize
-      @config_path        = default_config_path
+      @config_path        = nil
       @config_root_key    = nil
       @shards             = nil
       @default_shard      = nil
@@ -21,17 +22,19 @@ module SchemaShard
       @default_schema     = 'public'
       @persistent_schemas = []
       @excluded_models    = []
-      @max_pools          = [ENV.fetch('SCHEMA_SHARD_MAX_POOLS', ENV.fetch('TENANT_SHARD_MAX_POOLS', 10)).to_i, 1].max
-      @cleanup_threshold  = clamp_cleanup_threshold(
-        ENV.fetch('SCHEMA_SHARD_CLEANUP_THRESHOLD', ENV.fetch('TENANT_SHARD_CLEANUP_THRESHOLD', 8)).to_i
-      )
+      @max_pools          = [ENV.fetch('SCHEMA_SHARD_MAX_POOLS', 10).to_i, 1].max
+      @cleanup_threshold  = clamp_cleanup_threshold(ENV.fetch('SCHEMA_SHARD_CLEANUP_THRESHOLD', 8).to_i)
       @default_pool_size  = [ENV.fetch('RAILS_MAX_THREADS', 5).to_i, 1].max
       @checkout_timeout   = 5
       @reaping_frequency  = 10
-      @logger             = default_logger
-      @env                = default_env
+      @logger             = nil
+      @env                = nil
       @log_shard_queries  = false
       @auto_fork_safety   = true
+    end
+
+    def config_path
+      @config_path || default_config_path
     end
 
     def tenant_mode=(mode)

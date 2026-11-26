@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'English'
 require_relative 'base'
 
 module SchemaShard
@@ -7,6 +8,10 @@ module SchemaShard
     class Postgresql < Base
       FORBIDDEN_SCHEMA_PREFIXES = %w[pg_].freeze
       FORBIDDEN_SCHEMAS         = %w[information_schema].freeze
+
+      def supports_namespaces?
+        true
+      end
 
       def apply_read_only_config(merged_config)
         updated = merged_config.dup
@@ -29,23 +34,31 @@ module SchemaShard
         true
       end
 
-      def switch_namespace(conn, tenant, persistent_schemas: [])
-        previous_path = conn.respond_to?(:schema_search_path) ? conn.schema_search_path : nil
+      def switch_namespace(conn, tenant, persistent_schemas: [], shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
+        previous_path  = conn.respond_to?(:schema_search_path) ? conn.schema_search_path : nil
         target_schemas = ([tenant] + Array(persistent_schemas).map(&:to_s)).uniq
         conn.schema_search_path = format_search_path(target_schemas)
+        conn.clear_cache! if conn.respond_to?(:clear_cache!)
         yield
       ensure
-        conn.schema_search_path = previous_path if previous_path && conn.respond_to?(:schema_search_path=)
+        restore_search_path(conn, previous_path)
       end
 
       def current_namespace(conn, live: false)
         return conn.select_value('SHOW search_path').to_s if live && conn.respond_to?(:select_value)
-
         return conn.schema_search_path.to_s if conn.respond_to?(:schema_search_path)
 
         nil
       rescue StandardError
         nil
+      end
+
+      def namespace_matches?(conn, expected_tenant, persistent_schemas: [])
+        actual_path = current_namespace(conn, live: false)
+        return false if actual_path.nil?
+
+        expected = ([expected_tenant] + Array(persistent_schemas).map(&:to_s)).uniq
+        search_path_matches?(actual_path, expected)
       end
 
       def verify_and_restore_namespace!(conn, expected_tenant:, persistent_schemas: [], live: false)
@@ -72,7 +85,14 @@ module SchemaShard
       end
 
       def format_search_path(schemas)
-        schemas.map { |s| %("#{s}") }.join(', ')
+        schemas.map do |s|
+          str = s.to_s.strip
+          unless valid_tenant_identifier?(str)
+            raise InvalidTenantError, "Invalid schema identifier in search_path: #{s.inspect}"
+          end
+
+          %("#{str.gsub('"', '""')}")
+        end.join(', ')
       end
 
       def search_path_matches?(current_path, expected_schemas)
@@ -93,6 +113,19 @@ module SchemaShard
       def forbidden_tenant?(str)
         downcased = str.downcase
         FORBIDDEN_SCHEMAS.include?(downcased) || FORBIDDEN_SCHEMA_PREFIXES.any? { |p| downcased.start_with?(p) }
+      end
+
+      private
+
+      def restore_search_path(conn, previous_path)
+        return unless previous_path && conn.respond_to?(:schema_search_path=)
+
+        conn.schema_search_path = previous_path
+        conn.clear_cache! if conn.respond_to?(:clear_cache!)
+      rescue StandardError
+        # Do not mask an in-flight exception (e.g. Timeout::Error / PG::InFailedSqlTransaction);
+        # ConnectionSanitizer will perform live verification and discard the connection fail-closed.
+        raise unless $ERROR_INFO
       end
     end
 

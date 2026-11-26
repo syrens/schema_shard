@@ -10,14 +10,23 @@ module SchemaShard
       adapter
       host
       port
+      socket
       database
       username
       url
       sslmode
+      ssl_mode
+      sslrootcert
+      sslcert
+      sslkey
       variables
+      pragmas
       schema_search_path
+      prepared_statements
+      advisory_locks
       pool
       checkout_timeout
+      timeout
       reaping_frequency
       encoding
     ].freeze
@@ -33,14 +42,15 @@ module SchemaShard
     def acquire(config, shard_key, db_adapter:, read_only: true, tenant: nil)
       resolved_config = db_adapter.resolve_shard_config(config, tenant: tenant)
       per_tenant      = db_adapter.per_tenant_pool?(config)
-      pool_key        = cached_pool_key(resolved_config, shard_key,
-                                        read_only: read_only, tenant: tenant, per_tenant_pool: per_tenant)
+      pool_key        = resolve_pool_key(resolved_config, shard_key,
+                                         read_only: read_only, per_tenant_pool: per_tenant)
 
       loop do
         now = monotonic_now
 
+        # Always try lock-free fast path for an existing live pool before locking.
         existing = @connection_pools[pool_key]
-        if existing && @connection_pools.size < @configuration.cleanup_threshold
+        if existing
           return existing if existing.try_acquire?(now)
 
           next
@@ -116,6 +126,7 @@ module SchemaShard
           pools_to_disconnect << entry.pool
         end
         @connection_pools.clear
+        @pool_keys_cache.clear
       end
 
       pools_to_disconnect.each { |pool| safe_disconnect(pool) }
@@ -132,7 +143,7 @@ module SchemaShard
       evicted_pools = []
 
       @mutex.synchronize do
-        @connection_pools.each_key do |key|
+        @connection_pools.keys.each do |key| # rubocop:disable Style/HashEachMethods
           pool = try_evict_pool_without_lock(key)
           evicted_pools << pool if pool
         end
@@ -171,6 +182,7 @@ module SchemaShard
       identity   = POOL_IDENTITY_KEYS.each_with_object({}) do |k, acc|
         acc[k] = str_config[k] if str_config.key?(k)
       end
+      identity['password_digest'] = Digest::SHA256.hexdigest(str_config['password'].to_s) if str_config.key?('password')
       identity['read_only'] = read_only
 
       digest = Digest::SHA256.hexdigest(JSON.generate(identity))[0, 16]
@@ -178,14 +190,7 @@ module SchemaShard
     end
 
     def build_connection_pool(config, pool_key, db_adapter:, read_only: true)
-      str_config = stringify_keys(config)
-      merged = db_adapter.default_pool_options(@configuration).merge(str_config)
-
-      merged['pool']              = [merged['pool'].to_i, 1].max
-      merged['checkout_timeout']  = merged['checkout_timeout'].to_f
-      merged['reaping_frequency'] = merged['reaping_frequency'].to_f
-
-      merged = db_adapter.apply_read_only_config(merged) if read_only
+      merged = merge_pool_options(config, db_adapter: db_adapter, read_only: read_only)
 
       db_config = ActiveRecord::DatabaseConfigurations::HashConfig.new(
         @configuration.effective_env,
@@ -205,41 +210,66 @@ module SchemaShard
 
     private
 
+    def merge_pool_options(config, db_adapter:, read_only:)
+      str_config = resolve_url_options(stringify_keys(config))
+      merged     = db_adapter.default_pool_options(@configuration).merge(str_config)
+      merged['pool']              = [merged['pool'].to_i, 1].max
+      merged['checkout_timeout']  = merged['checkout_timeout'].to_f
+      merged['reaping_frequency'] = merged['reaping_frequency'].to_f
+      read_only ? db_adapter.apply_read_only_config(merged) : merged
+    end
+
+    def resolve_url_options(str_config)
+      url = str_config['url']
+      return str_config if url.nil? || url.to_s.strip.empty?
+
+      resolved = ActiveRecord::DatabaseConfigurations::ConnectionUrlResolver.new(url.to_s)
+                                                                            .to_hash.transform_keys(&:to_s)
+      resolved.merge(str_config.except('url'))
+    end
+
     def acquire_under_lock(resolved_config, shard_key, pool_key, db_adapter:, read_only:, now:)
       created       = false
       evicted_pools = []
       lru_removed   = 0
       acquired      = nil
 
-      @mutex.synchronize do
-        if @connection_pools.size >= @configuration.cleanup_threshold
-          lru_evicted = run_lru_cleanup_without_lock!
-          lru_removed = lru_evicted.size
-          evicted_pools.concat(lru_evicted)
+      begin
+        @mutex.synchronize do
+          entry = @connection_pools[pool_key]
+          if entry&.try_acquire?(now)
+            acquired = entry
+          else
+            if @connection_pools.size >= @configuration.cleanup_threshold
+              lru_evicted = run_lru_cleanup_without_lock!(exclude_key: pool_key)
+              lru_removed = lru_evicted.size
+              evicted_pools.concat(lru_evicted)
+            end
+
+            evicted = enforce_pool_limit_without_lock!(pool_key)
+            evicted_pools << evicted if evicted
+
+            new_pool  = build_connection_pool(resolved_config, pool_key, db_adapter: db_adapter, read_only: read_only)
+            new_entry = PoolEntry.new(pool: new_pool, pool_key: pool_key, shard_key: shard_key, accessed_at: now)
+            new_entry.try_acquire?(now)
+            @connection_pools[pool_key] = new_entry
+            acquired = new_entry
+            created  = true
+          end
         end
-
-        entry = @connection_pools[pool_key]
-        if entry&.try_acquire?(now)
-          acquired = entry
-        else
-          evicted = enforce_pool_limit_without_lock!(pool_key)
-          evicted_pools << evicted if evicted
-
-          new_pool  = build_connection_pool(resolved_config, pool_key, db_adapter: db_adapter, read_only: read_only)
-          new_entry = PoolEntry.new(pool: new_pool, pool_key: pool_key, shard_key: shard_key, accessed_at: now)
-          new_entry.try_acquire?(now)
-          @connection_pools[pool_key] = new_entry
-          acquired = new_entry
-          created  = true
-
-          logger&.info "[SchemaShard] Created pool '#{pool_key}' " \
-                       "(#{@connection_pools.size}/#{@configuration.max_pools})"
-        end
+      ensure
+        evicted_pools.each { |evicted_pool| safe_disconnect(evicted_pool) }
       end
 
-      evicted_pools.each { |evicted_pool| safe_disconnect(evicted_pool) }
+      log_pool_created(pool_key) if created
       record_acquire_metrics(shard_key, created: created, evicted_count: evicted_pools.size, lru_removed: lru_removed)
       acquired
+    end
+
+    def log_pool_created(pool_key)
+      logger&.info "[SchemaShard] Created pool '#{pool_key}' (#{@connection_pools.size}/#{@configuration.max_pools})"
+    rescue StandardError
+      nil
     end
 
     def record_acquire_metrics(shard_key, created:, evicted_count:, lru_removed:)
@@ -253,12 +283,11 @@ module SchemaShard
       @metrics.increment(:pools_cleanup_total, 1) if lru_removed.positive?
     end
 
-    def cached_pool_key(config, shard_key, read_only:, tenant:, per_tenant_pool:)
-      cache_id = if per_tenant_pool
-                   "#{shard_key}:#{tenant}:#{read_only ? 'ro' : 'rw'}"
-                 else
-                   "#{shard_key}:#{read_only ? 'ro' : 'rw'}"
-                 end
+    # Skip @pool_keys_cache for per-tenant pools to avoid unbounded RAM growth.
+    def resolve_pool_key(config, shard_key, read_only:, per_tenant_pool:)
+      return build_pool_key(config, shard_key, read_only: read_only) if per_tenant_pool
+
+      cache_id = "#{shard_key}:#{read_only ? 'ro' : 'rw'}"
       @pool_keys_cache.compute_if_absent(cache_id) do
         build_pool_key(config, shard_key, read_only: read_only)
       end
@@ -285,10 +314,11 @@ module SchemaShard
             "Connection pool limit (#{@configuration.max_pools}) reached and no idle evictable pool found"
     end
 
-    def run_lru_cleanup_without_lock!
+    def run_lru_cleanup_without_lock!(exclude_key: nil)
       target      = [@configuration.cleanup_threshold - 2, 0].max
       sorted_keys = @connection_pools
                     .each_pair
+                    .reject { |k, _| k == exclude_key }
                     .sort_by { |_, entry| entry.last_accessed }
                     .map(&:first)
       evicted     = []
@@ -348,11 +378,16 @@ module SchemaShard
       false
     end
 
+    # Never call disconnect! in a forked child — it would transmit Terminate/COM_QUIT
+    # packets over sockets inherited from the parent process.
     def safe_discard_pool(pool)
-      if pool.respond_to?(:discard_pool!)
+      if pool.respond_to?(:discard!)
+        pool.discard!
+      elsif pool.respond_to?(:discard_pool!)
         pool.discard_pool!
       else
-        pool.disconnect!
+        logger&.error '[SchemaShard] Pool does not support #discard!; dropping reference without disconnecting'
+        return false
       end
       true
     rescue StandardError => e

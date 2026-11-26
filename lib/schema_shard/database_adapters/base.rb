@@ -27,6 +27,10 @@ module SchemaShard
         @instance ||= new
       end
 
+      def supports_namespaces?
+        false
+      end
+
       def validate_config!(shard_key, shard_cfg)
         has_url = present_value?(shard_cfg['url'] || shard_cfg[:url])
         has_host_and_db = present_value?(shard_cfg['host'] || shard_cfg[:host]) &&
@@ -50,10 +54,9 @@ module SchemaShard
         end
 
         raise InvalidTenantError, "Invalid tenant name: #{str.inspect}" unless valid_tenant_identifier?(str)
-
         raise InvalidTenantError, "Forbidden system namespace: #{str.inspect}" if forbidden_tenant?(str)
 
-        if default_namespace && str == default_namespace && !allow_public
+        if default_namespace && str.casecmp?(default_namespace.to_s) && !allow_public
           raise InvalidTenantError,
                 "Default namespace '#{str}' requires explicit allow_public: true or SchemaShard.with_public"
         end
@@ -95,12 +98,20 @@ module SchemaShard
         true
       end
 
-      def switch_namespace(_conn, _tenant, persistent_schemas: []) # rubocop:disable Lint/UnusedMethodArgument
-        yield
+      # Fail closed: adapters that do not implement tenant isolation must NOT silently
+      # execute tenant-scoped queries against a shared database.
+      def switch_namespace(_conn, _tenant, persistent_schemas: [], shard_config: nil) # rubocop:disable Lint/UnusedMethodArgument
+        raise ConfigurationError,
+              "#{self.class.name} does not support tenant namespace switching; " \
+              'use SchemaShard.on_shard, set tenant_mode: :none, or register a custom adapter'
       end
 
       def current_namespace(_conn, live: false) # rubocop:disable Lint/UnusedMethodArgument
         nil
+      end
+
+      def namespace_matches?(_conn, _expected_tenant, persistent_schemas: []) # rubocop:disable Lint/UnusedMethodArgument
+        true
       end
 
       def verify_and_restore_namespace!(_conn, expected_tenant:, persistent_schemas: [], live: false) # rubocop:disable Lint/UnusedMethodArgument
